@@ -13,7 +13,43 @@ import StkModal from "../components/sales/StkModal";
 import SettlePaymentModal from "../components/sales/SettlePaymentModal";
 
 const PAGE_SIZE = 40;
-const DRAFT_KEY = "duka_pos_draft_sale";
+const DRAFT_PREFIX = "duka_pos_draft_sale";
+// A basket nobody touched for a whole shift is abandoned stock, not a sale in
+// progress, and it comes back with prices and stock that no longer match.
+const DRAFT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+// sessionStorage dies with the tab, so a browser crash, a sign-out or a machine
+// restart took the sale in progress with it. The draft is keyed by cashier and
+// branch: the next person on the same till must not inherit someone else's
+// basket, and neither must a different shop.
+function draftKey(username, branchId) {
+  if (!username || !branchId) return "";
+  return `${DRAFT_PREFIX}.${username}.${branchId}`;
+}
+
+function readDraft(key) {
+  if (!key) return null;
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "null");
+    return saved && Array.isArray(saved.cart) ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+// A phone browser in private mode refuses storage; losing the draft is better
+// than losing the sale screen.
+function writeDraft(key, draft) {
+  try {
+    localStorage.setItem(key, JSON.stringify(draft));
+  } catch {}
+}
+
+function clearDraft(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {}
+}
 
 const SETTLED_LABELS = {
   cash: "Cash",
@@ -23,17 +59,6 @@ const SETTLED_LABELS = {
   card: "Card",
   bank_transfer: "Bank transfer",
 };
-
-// A half-entered sale is real work: the counter must not lose it to a page
-// refresh, an idle sign-out or a lost connection.
-function readSavedDraft() {
-  try {
-    const saved = JSON.parse(sessionStorage.getItem(DRAFT_KEY) || "null");
-    return saved && Array.isArray(saved.cart) ? saved : null;
-  } catch {
-    return null;
-  }
-}
 
 function floorOf(product) {
   return Number(product?.price_floor ?? product?.cost_price ?? 0);
@@ -52,7 +77,8 @@ function safaricomReason(text) {
 
 export default function SalesScreen() {
   const { branches, branchQuery, canViewAllBranches, user, shop } = useAuth();
-  const [savedDraft] = useState(readSavedDraft);
+  const username = user?.username || "";
+  const draftRestored = useRef(false);
   const [catalog, setCatalog] = useState({ results: [], count: 0, next: null });
   const [known, setKnown] = useState({});
   const [categories, setCategories] = useState([]);
@@ -62,10 +88,10 @@ export default function SalesScreen() {
   const [lowOnly, setLowOnly] = useState(false);
   const [loadingProducts, setLoadingProducts] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [cart, setCart] = useState(savedDraft?.cart ?? []);
-  const [customerName, setCustomerName] = useState(savedDraft?.customerName ?? "");
-  const [customerPhone, setCustomerPhone] = useState(savedDraft?.customerPhone ?? "");
-  const [paymentMode, setPaymentMode] = useState(savedDraft?.paymentMode ?? "paid");
+  const [cart, setCart] = useState([]);
+  const [customerName, setCustomerName] = useState("");
+  const [customerPhone, setCustomerPhone] = useState("");
+  const [paymentMode, setPaymentMode] = useState("paid");
   const [partialAmount, setPartialAmount] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("cash");
   const [paymentReference, setPaymentReference] = useState("");
@@ -99,28 +125,57 @@ export default function SalesScreen() {
     if (branchQuery) setManualBranch("");
   }, [branchQuery]);
 
+  // Reading the draft has to happen before anything is written, because the
+  // first render starts with an empty basket and writing that would erase the
+  // very draft about to be read back.
   useEffect(() => {
-    if (cart.length === 0 && !customerName && !customerPhone) {
-      sessionStorage.removeItem(DRAFT_KEY);
+    if (draftRestored.current) return;
+    const key = draftKey(username, sellingBranchId);
+    if (!key) return;
+    draftRestored.current = true;
+    // The catalog loads before the branch does, so a cashier may already have
+    // started a basket. Never overwrite work in progress.
+    if (cart.length > 0) return;
+    const draft = readDraft(key);
+    if (!draft) return;
+    const age = Date.now() - Number(draft.savedAt || 0);
+    if (draft.cart.length === 0 || age > DRAFT_MAX_AGE_MS) {
+      clearDraft(key);
+      if (draft.cart.length > 0) {
+        setStatus({
+          type: "warning",
+          message: `A basket left ${Math.max(1, Math.round(age / 3600000))} hours ago was cleared. Prices and stock move, so it is not safe to complete an abandoned sale.`,
+        });
+      }
       return;
     }
-    sessionStorage.setItem(
-      DRAFT_KEY,
-      JSON.stringify({ cart, customerName, customerPhone, paymentMode }),
-    );
-  }, [cart, customerName, customerPhone, paymentMode]);
+    setCart(draft.cart);
+    setCustomerName(draft.customerName || "");
+    setCustomerPhone(draft.customerPhone || "");
+    setPaymentMode(draft.paymentMode || "paid");
+    setStatus({
+      type: "warning",
+      message:
+        "Your unfinished sale was restored after the till reloaded. Check the basket before completing it.",
+    });
+  }, [username, sellingBranchId, cart.length]);
 
   useEffect(() => {
-    if (savedDraft?.cart?.length) {
-      setStatus((current) =>
-        current || {
-          type: "warning",
-          message: "Your unfinished sale was restored after the page reloaded. Check the basket before completing it.",
-        },
-      );
+    const key = draftKey(username, sellingBranchId);
+    // Wait for the restore above, or an empty first render deletes the draft.
+    if (!key || !draftRestored.current) return;
+    if (cart.length === 0 && !customerName && !customerPhone) {
+      clearDraft(key);
+      return;
     }
-    // Only on mount: the restored draft must be announced exactly once.
-  }, [savedDraft]);
+    writeDraft(key, {
+      cart,
+      customerName,
+      customerPhone,
+      paymentMode,
+      savedAt: Date.now(),
+    });
+  }, [cart, customerName, customerPhone, paymentMode, username, sellingBranchId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
@@ -182,12 +237,16 @@ export default function SalesScreen() {
     // also wipe a basket restored from the saved draft.
     if (!previous || previous === sellingBranchId) return;
     stopPayWatch();
+    // The basket is dropped, so its saved copy goes too. Leaving it behind would
+    // offer the cashier an invisible sale from a different shop.
+    clearDraft(draftKey(username, previous));
+    draftRestored.current = true;
     setCart([]);
     setLastReceipt(null);
     setStatus(null);
     setPayStatus(null);
     checkoutKeyRef.current = "";
-  }, [sellingBranchId]);
+  }, [sellingBranchId, username]);
 
   useEffect(() => stopPayWatch, []);
 

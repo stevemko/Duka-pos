@@ -101,9 +101,13 @@ restart Vite.
 - **Credit sales**: enter the customer name or phone. Settle later from
   **Transactions → Credits & balances → Open → Record payment** (cash, mobile
   money, card, bank) or **M-Pesa prompt**.
+- **If the till restarts mid-sale** (browser crash, power blip, sign-out on
+  idle): reopen the app and the basket comes back for that cashier at that
+  branch, with a warning to check it before completing. A basket left over more
+  than six hours is dropped, because its prices and stock are no longer true.
+  Switching branch always starts a fresh basket.
 - **End of day**: **Transactions** defaults to today. Check the totals in view,
-  open any receipt to print, then **Export CSV** for your records/accountant.
-- **Month end**: **Dashboard**, choose the month, export the transaction CSV
+  open any receipt to print, then **Export CSV** for your records/accountant.- **Month end**: **Dashboard**, choose the month, export the transaction CSV
   and review gross profit, expenses and net profit.
 
 Sales and payments are immutable: once saved they cannot be edited or deleted,
