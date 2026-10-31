@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.sqlite3
+db.sqlite3
+db.fresh-demo.sqlite3
+media/
+staticfiles/
+
+# Environment files (keep the examples)
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+*.local
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local virtualenv, archives and staging copies (never version these)
+*_venv/
+*.zip
+*.bak
+pos-upload/

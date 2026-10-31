@@ -1,0 +1,1060 @@
+from decimal import Decimal
+from datetime import timedelta
+from io import StringIO
+from unittest.mock import patch
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
+from django.core.management import call_command
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+from rest_framework.authtoken.models import Token
+from rest_framework.test import APIClient
+from products.models import Product
+from .models import Payment, Sale, SaleReceipt
+
+
+class SaleStockTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.client.force_authenticate(user=user)
+		self.product = Product.objects.create(
+			name="Rice",
+			sku="RICE-001",
+			cost_price="100.00",
+			selling_price="125.00",
+			stock_quantity=10,
+		)
+
+	def test_sale_deducts_stock(self):
+		response = self.client.post(
+			reverse("sale-list"),
+			{
+				"product": str(self.product.id),
+				"quantity": 3,
+				"price_sold_at": "125.00",
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.product.refresh_from_db()
+		self.assertEqual(self.product.stock_quantity, 7)
+		self.assertEqual(Sale.objects.count(), 1)
+
+	def test_sale_cannot_exceed_available_stock(self):
+		response = self.client.post(
+			reverse("sale-list"),
+			{
+				"product": str(self.product.id),
+				"quantity": 11,
+				"price_sold_at": "125.00",
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.product.refresh_from_db()
+		self.assertEqual(self.product.stock_quantity, 10)
+		self.assertEqual(Sale.objects.count(), 0)
+
+	def test_sale_below_cost_is_rejected(self):
+		response = self.client.post(
+			reverse("sale-list"),
+			{
+				"product": str(self.product.id),
+				"quantity": 1,
+				"price_sold_at": "99.99",
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(Sale.objects.count(), 0)
+
+	def test_sale_profit_uses_cost_snapshot(self):
+		response = self.client.post(
+			reverse("sale-list"),
+			{
+				"product": str(self.product.id),
+				"quantity": 2,
+				"price_sold_at": "125.00",
+			},
+			format="json",
+		)
+		sale = Sale.objects.get(pk=response.data["id"])
+		self.product.cost_price = Decimal("110.00")
+		self.product.save(update_fields=["cost_price"])
+		sale.refresh_from_db()
+
+		self.assertEqual(sale.cost_price_at_sale, Decimal("100.00"))
+		self.assertEqual(sale.profit, Decimal("50.00"))
+
+	def test_recorded_sale_cannot_be_changed_or_deleted_in_application_code(self):
+		sale = Sale.objects.create(
+			product=self.product,
+			quantity=1,
+			price_sold_at=Decimal("125.00"),
+		)
+		sale.quantity = 2
+
+		with self.assertRaises(ValidationError):
+			sale.save()
+		with self.assertRaises(ValidationError):
+			sale.delete()
+
+	def test_recorded_sale_cannot_be_edited_or_deleted(self):
+		create_response = self.client.post(
+			reverse("sale-list"),
+			{
+				"product": str(self.product.id),
+				"quantity": 3,
+				"price_sold_at": "125.00",
+			},
+			format="json",
+		)
+		sale_url = reverse("sale-detail", kwargs={"pk": create_response.data["id"]})
+
+		update_response = self.client.patch(sale_url, {"quantity": 1}, format="json")
+		delete_response = self.client.delete(sale_url)
+
+		self.assertEqual(update_response.status_code, 405)
+		self.assertEqual(delete_response.status_code, 405)
+		self.product.refresh_from_db()
+		self.assertEqual(self.product.stock_quantity, 7)
+		self.assertEqual(Sale.objects.count(), 1)
+
+	def test_daily_summary_includes_sales_beyond_first_page(self):
+		self.product.refresh_from_db()
+		for _ in range(60):
+			Sale.objects.create(
+				product=self.product,
+				quantity=1,
+				price_sold_at=Decimal("125.00"),
+			)
+
+		response = self.client.get(reverse("sale-summary"))
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["total_sales"], Decimal("7500.00"))
+		self.assertEqual(response.data["gross_profit"], Decimal("1500.00"))
+		self.assertEqual(response.data["items_sold"], 60)
+
+
+class CartCheckoutTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.client.force_authenticate(user=user)
+		self.rice = Product.objects.create(
+			name="Rice",
+			sku="CHECKOUT-RICE",
+			cost_price="100.00",
+			selling_price="125.00",
+			stock_quantity=10,
+		)
+		self.sugar = Product.objects.create(
+			name="Sugar",
+			sku="CHECKOUT-SUGAR",
+			cost_price="80.00",
+			selling_price="100.00",
+			stock_quantity=5,
+		)
+		self.checkout_url = reverse("sale-checkout")
+
+	def test_multi_item_paid_checkout_creates_receipt_and_deducts_stock(self):
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"items": [
+						{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"},
+						{"product": str(self.sugar.id), "quantity": 1, "price_sold_at": "100.00"},
+				],
+				"payments": [{"amount": "350.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.data["total"], "350.00")
+		self.assertEqual(response.data["amount_paid"], "350.00")
+		self.assertEqual(response.data["balance"], "0.00")
+		self.assertEqual(response.data["payment_status"], "paid")
+		self.assertEqual(len(response.data["items"]), 2)
+		self.assertEqual(SaleReceipt.objects.count(), 1)
+		self.assertEqual(Payment.objects.count(), 1)
+		self.rice.refresh_from_db()
+		self.sugar.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 8)
+		self.assertEqual(self.sugar.stock_quantity, 4)
+
+	def test_partial_payment_requires_customer_and_tracks_balance(self):
+		payload = {
+			"customer_name": "Amina",
+			"items": [{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"}],
+			"payments": [{"amount": "100.00", "method": "mobile_money", "reference": "TX-1"}],
+		}
+
+		response = self.client.post(self.checkout_url, payload, format="json")
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.data["payment_status"], "partially_paid")
+		self.assertEqual(response.data["balance"], "150.00")
+		self.assertEqual(response.data["payments"][0]["reference"], "TX-1")
+
+	def test_unpaid_checkout_is_marked_on_credit(self):
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"customer_phone": "+254700000000",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.data["payment_status"], "on_credit")
+		self.assertEqual(response.data["amount_paid"], "0.00")
+
+	def test_insufficient_stock_rejects_entire_cart(self):
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"items": [
+					{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"},
+					{"product": str(self.sugar.id), "quantity": 6, "price_sold_at": "100.00"},
+				],
+				"payments": [{"amount": "225.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+		self.assertEqual(Sale.objects.count(), 0)
+		self.rice.refresh_from_db()
+		self.sugar.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 10)
+		self.assertEqual(self.sugar.stock_quantity, 5)
+
+	def test_unpaid_and_overpaid_checkout_payloads_are_rejected(self):
+		missing_customer = self.client.post(
+			self.checkout_url,
+			{"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}]},
+			format="json",
+		)
+		overpayment = self.client.post(
+			self.checkout_url,
+			{
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "126.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(missing_customer.status_code, 400)
+		self.assertEqual(overpayment.status_code, 400)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+
+	def test_checkout_rejects_sale_price_below_cost(self):
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"items": [{
+					"product": str(self.rice.id),
+					"quantity": 1,
+					"price_sold_at": "99.99",
+				}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+		self.assertEqual(Sale.objects.count(), 0)
+
+	def test_checkout_requires_actual_charged_price(self):
+		response = self.client.post(
+			self.checkout_url,
+			{"items": [{"product": str(self.rice.id), "quantity": 1}]},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+
+	def test_monthly_analytics_separates_sales_from_collections(self):
+		checkout = self.client.post(
+			self.checkout_url,
+			{
+				"customer_name": "Amina",
+				"customer_phone": "0700000000",
+				"items": [{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "100.00", "method": "cash"}],
+			},
+			format="json",
+		)
+		month = timezone.localdate().strftime("%Y-%m")
+
+		response = self.client.get(reverse("sale-analytics"), {"month": month})
+		credit_response = self.client.get(reverse("receipt-credits"))
+		manager = get_user_model().objects.create_user(
+			username="finance-manager", password="test-password", is_staff=True
+		)
+		manager_client = APIClient()
+		manager_client.force_authenticate(manager)
+		manager_response = manager_client.get(reverse("sale-analytics"), {"month": month})
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["total_sales"], Decimal("250.00"))
+		self.assertIsNone(response.data["gross_profit"])
+		self.assertEqual(manager_response.data["gross_profit"], Decimal("50.00"))
+		self.assertEqual(response.data["items_sold"], 2)
+		self.assertEqual(response.data["daily_totals"][0]["amount_collected"], Decimal("100.00"))
+		self.assertEqual(response.data["top_product"]["product_name"], "Rice")
+		self.assertEqual(credit_response.data["outstanding_total"], Decimal("150.00"))
+		self.assertEqual(credit_response.data["credits"][0]["customer_name"], "Amina")
+		self.assertEqual(credit_response.data["credits"][0]["customer_phone"], "0700000000")
+
+	def test_analytics_breaks_sales_by_category_and_payment_method(self):
+		self.rice.category = "Grains"
+		self.rice.save(update_fields=["category"])
+		self.sugar.category = "Pantry"
+		self.sugar.save(update_fields=["category"])
+		self.client.post(
+			self.checkout_url,
+			{
+				"items": [
+					{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"},
+					{"product": str(self.sugar.id), "quantity": 1, "price_sold_at": "100.00"},
+				],
+				"payments": [
+					{"amount": "200.00", "method": "cash"},
+					{"amount": "150.00", "method": "bank_transfer"},
+				],
+			},
+			format="json",
+		)
+
+		response = self.client.get(
+			reverse("sale-analytics"), {"month": timezone.localdate().strftime("%Y-%m")}
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["total_sales"], Decimal("350.00"))
+		self.assertIsNone(response.data["gross_profit"])
+		categories = {row["category"]: row for row in response.data["sales_by_category"]}
+		self.assertEqual(categories["Grains"]["sales_total"], Decimal("250.00"))
+		self.assertEqual(categories["Pantry"]["sales_total"], Decimal("100.00"))
+		self.assertEqual(categories["Grains"]["share"], Decimal("71.4"))
+		methods = {row["method"]: row for row in response.data["payment_mix"]}
+		self.assertEqual(methods["cash"]["amount"], Decimal("200.00"))
+		self.assertEqual(methods["bank_transfer"]["amount"], Decimal("150.00"))
+		self.assertEqual(methods["cash"]["share"], Decimal("57.1"))
+		self.assertEqual(len(response.data["product_performance"]), 2)
+		self.assertEqual(response.data["stagnant_count"], 0)
+
+	def test_sales_can_be_filtered_by_date_and_product(self):
+		Sale.objects.create(product=self.rice, quantity=1, price_sold_at=Decimal("125.00"))
+		Sale.objects.create(product=self.sugar, quantity=1, price_sold_at=Decimal("100.00"))
+		date_value = timezone.localdate().isoformat()
+
+		response = self.client.get(reverse("sale-list"), {
+			"start_date": date_value,
+			"end_date": date_value,
+			"product": str(self.rice.id),
+		})
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["count"], 1)
+		self.assertEqual(response.data["results"][0]["product_name"], "Rice")
+
+	def test_checkout_cannot_claim_an_stk_payment_as_already_paid(self):
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "mpesa_stk"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+
+	def test_paybill_payment_requires_confirmation_code(self):
+		payload = {
+			"items": [{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"}],
+			"payments": [{"amount": "250.00", "method": "mpesa_paybill"}],
+		}
+
+		missing_reference = self.client.post(self.checkout_url, payload, format="json")
+
+		self.assertEqual(missing_reference.status_code, 400)
+		self.assertIn("reference", missing_reference.data["payments"][0])
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+
+		payload["payments"][0]["reference"] = "SLK7XYZ12A"
+		recorded = self.client.post(self.checkout_url, payload, format="json")
+
+		self.assertEqual(recorded.status_code, 201)
+		self.assertEqual(recorded.data["payment_status"], "paid")
+		self.assertEqual(recorded.data["payments"][0]["method"], "mpesa_paybill")
+		self.assertEqual(recorded.data["payments"][0]["reference"], "SLK7XYZ12A")
+
+	def test_receipt_payment_settles_balance_and_updates_status(self):
+		checkout = self.client.post(
+			self.checkout_url,
+			{
+				"customer_name": "Amina",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+		payment_response = self.client.post(
+			reverse("receipt-payments", kwargs={"pk": checkout.data["id"]}),
+			{"amount": "125.00", "method": "mobile_money"},
+			format="json",
+		)
+
+		self.assertEqual(payment_response.status_code, 201)
+		self.assertEqual(payment_response.data["payment_status"], "paid")
+		self.assertEqual(payment_response.data["balance"], "0.00")
+
+	def test_receipt_payment_cannot_exceed_balance(self):
+		checkout = self.client.post(
+			self.checkout_url,
+			{
+				"customer_name": "Amina",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+		payment_response = self.client.post(
+			reverse("receipt-payments", kwargs={"pk": checkout.data["id"]}),
+			{"amount": "126.00", "method": "cash"},
+			format="json",
+		)
+
+		self.assertEqual(payment_response.status_code, 400)
+		self.assertEqual(Payment.objects.count(), 0)
+
+	def create_credit_receipt(self):
+		return self.client.post(
+			self.checkout_url,
+			{
+				"customer_name": "Amina",
+				"customer_phone": "0794671494",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+
+	@patch("sales.views.initiate_stk_push")
+	def test_stk_push_creates_pending_payment_without_counting_it_paid(self, initiate):
+		initiate.return_value = {
+			"ResponseCode": "0",
+			"MerchantRequestID": "merchant-1",
+			"CheckoutRequestID": "checkout-1",
+			"CustomerMessage": "Prompt sent",
+		}
+		receipt = self.create_credit_receipt()
+		response = self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": receipt.data["id"]}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 202)
+		self.assertEqual(response.data["receipt"]["payment_status"], "payment_pending")
+		self.assertEqual(response.data["receipt"]["amount_paid"], "0.00")
+		self.assertEqual(response.data["receipt"]["payments"][0]["status"], "pending")
+		self.assertEqual(Payment.objects.get().checkout_request_id, "checkout-1")
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	@patch("sales.views.initiate_stk_push")
+	def test_successful_mpesa_callback_marks_payment_paid(self, initiate, _callback_config):
+		initiate.return_value = {
+			"ResponseCode": "0",
+			"CheckoutRequestID": "checkout-success",
+			"MerchantRequestID": "merchant-success",
+		}
+		receipt = self.create_credit_receipt()
+		self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": receipt.data["id"]}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		callback = self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{
+				"Body": {
+					"stkCallback": {
+						"CheckoutRequestID": "checkout-success",
+						"ResultCode": 0,
+						"ResultDesc": "Success",
+						"CallbackMetadata": {"Item": [
+							{"Name": "Amount", "Value": 125},
+							{"Name": "MpesaReceiptNumber", "Value": "QAB123XYZ"},
+						]},
+					}
+				}
+			},
+			format="json",
+		)
+
+		self.assertEqual(callback.status_code, 200)
+		payment = Payment.objects.get(checkout_request_id="checkout-success")
+		self.assertEqual(payment.status, Payment.Status.SUCCEEDED)
+		self.assertEqual(payment.reference, "QAB123XYZ")
+		self.assertEqual(payment.receipt.payment_status, "paid")
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	@patch("sales.views.initiate_stk_push")
+	def test_callback_rejects_amount_mismatch_and_invalid_token(self, initiate, _callback_config):
+		initiate.return_value = {"ResponseCode": "0", "CheckoutRequestID": "checkout-mismatch"}
+		receipt = self.create_credit_receipt()
+		self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": receipt.data["id"]}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+		callback_url = reverse("mpesa-callback")
+		callback_body = {
+			"Body": {
+				"stkCallback": {
+					"CheckoutRequestID": "checkout-mismatch",
+					"ResultCode": 0,
+					"CallbackMetadata": {"Item": [{"Name": "Amount", "Value": 124}]},
+				}
+			}
+		}
+
+		unauthorized = self.client.post(callback_url, callback_body, format="json")
+		accepted = self.client.post(callback_url + "?token=test-callback-token", callback_body, format="json")
+
+		self.assertEqual(unauthorized.status_code, 403)
+		self.assertEqual(accepted.status_code, 200)
+		payment = Payment.objects.get(checkout_request_id="checkout-mismatch")
+		self.assertEqual(payment.status, Payment.Status.FAILED)
+		self.assertEqual(payment.receipt.amount_paid, Decimal("0.00"))
+
+	def test_more_than_100_checkouts_are_recorded_and_receipts_are_paginated(self):
+		self.rice.stock_quantity = 110
+		self.rice.save(update_fields=["stock_quantity"])
+
+		for _ in range(105):
+			response = self.client.post(
+				self.checkout_url,
+				{
+					"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+					"payments": [{"amount": "125.00", "method": "cash"}],
+				},
+				format="json",
+			)
+			self.assertEqual(response.status_code, 201)
+
+		receipt_page = self.client.get(reverse("receipt-list"))
+		self.assertEqual(SaleReceipt.objects.count(), 105)
+		self.assertEqual(Sale.objects.count(), 105)
+		self.assertEqual(receipt_page.data["count"], 105)
+		self.assertEqual(len(receipt_page.data["results"]), 50)
+		self.assertIsNotNone(receipt_page.data["next"])
+
+
+class IdempotentCheckoutTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.client.force_authenticate(user=user)
+		self.rice = Product.objects.create(
+			name="Rice", cost_price="100.00", selling_price="125.00", stock_quantity=10,
+		)
+		self.checkout_url = reverse("sale-checkout")
+		self.payload = {
+			"items": [{"product": str(self.rice.id), "quantity": 2, "price_sold_at": "125.00"}],
+			"payments": [{"amount": "250.00", "method": "cash"}],
+		}
+
+	def test_repeated_checkout_with_same_key_returns_the_same_receipt(self):
+		first = self.client.post(
+			self.checkout_url, self.payload, format="json",
+			HTTP_IDEMPOTENCY_KEY="cart-123",
+		)
+		second = self.client.post(
+			self.checkout_url, self.payload, format="json",
+			HTTP_IDEMPOTENCY_KEY="cart-123",
+		)
+
+		self.assertEqual(first.status_code, 201)
+		self.assertEqual(second.status_code, 200)
+		self.assertEqual(first.data["id"], second.data["id"])
+		self.assertEqual(SaleReceipt.objects.count(), 1)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 8)
+
+	def test_different_keys_create_separate_receipts(self):
+		self.client.post(self.checkout_url, self.payload, format="json", HTTP_IDEMPOTENCY_KEY="cart-a")
+		second = self.client.post(
+			self.checkout_url, self.payload, format="json", HTTP_IDEMPOTENCY_KEY="cart-b"
+		)
+
+		self.assertEqual(second.status_code, 201)
+		self.assertEqual(SaleReceipt.objects.count(), 2)
+
+
+class MpesaCallbackEdgeTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.client.force_authenticate(user=user)
+		self.rice = Product.objects.create(
+			name="Rice", cost_price="100.00", selling_price="125.00", stock_quantity=5,
+		)
+		checkout = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+		self.receipt = SaleReceipt.objects.get(pk=checkout.data["id"])
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	@patch("sales.views.initiate_stk_push")
+	def test_callback_with_null_metadata_fails_the_payment_cleanly(self, initiate, _config):
+		initiate.return_value = {"ResponseCode": "0", "CheckoutRequestID": "checkout-null"}
+		self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": self.receipt.id}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		callback = self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{"Body": {"stkCallback": {
+				"CheckoutRequestID": "checkout-null",
+				"ResultCode": 0,
+				"ResultDesc": "Success",
+				"CallbackMetadata": None,
+			}}},
+			format="json",
+		)
+
+		self.assertEqual(callback.status_code, 200)
+		payment = Payment.objects.get(checkout_request_id="checkout-null")
+		self.assertEqual(payment.status, Payment.Status.FAILED)
+		self.assertEqual(payment.receipt.amount_paid, Decimal("0.00"))
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	@patch("sales.views.initiate_stk_push")
+	def test_duplicate_callback_does_not_double_count(self, initiate, _config):
+		initiate.return_value = {"ResponseCode": "0", "CheckoutRequestID": "checkout-dup"}
+		self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": self.receipt.id}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+		body = {"Body": {"stkCallback": {
+			"CheckoutRequestID": "checkout-dup",
+			"ResultCode": 0,
+			"CallbackMetadata": {"Item": [
+				{"Name": "Amount", "Value": 125},
+				{"Name": "MpesaReceiptNumber", "Value": "QAB1"},
+			]},
+		}}}
+		url = reverse("mpesa-callback") + "?token=test-callback-token"
+
+		self.client.post(url, body, format="json")
+		second = self.client.post(url, body, format="json")
+
+		self.assertEqual(second.status_code, 200)
+		self.assertEqual(self.receipt.payments.filter(status=Payment.Status.SUCCEEDED).count(), 1)
+		self.assertEqual(self.receipt.amount_paid, Decimal("125.00"))
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	def test_callback_rejects_malformed_payload(self, _config):
+		response = self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{"unexpected": True},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+
+
+class StaleStkPaymentTests(TestCase):
+	def setUp(self):
+		self.product = Product.objects.create(
+			name="Rice", cost_price="100.00", selling_price="125.00", stock_quantity=5,
+		)
+		self.receipt = SaleReceipt.objects.create(customer_name="Amina")
+		Sale.objects.create(
+			receipt=self.receipt,
+			product=self.product,
+			quantity=1,
+			price_sold_at=Decimal("125.00"),
+		)
+		self.payment = Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.PENDING,
+		)
+
+	def test_old_prompt_no_longer_keeps_receipt_pending(self):
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=10)
+		)
+
+		self.receipt.refresh_from_db()
+		self.assertEqual(self.receipt.payment_status, "on_credit")
+
+	def test_expire_stale_marks_old_prompts_failed(self):
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=10)
+		)
+
+		updated = self.receipt.expire_stale_stk_payments()
+
+		self.assertEqual(updated, 1)
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.FAILED)
+
+	def test_recent_prompt_is_not_expired(self):
+		self.assertEqual(self.receipt.expire_stale_stk_payments(), 0)
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+
+class ReconcileMpesaCommandTests(TestCase):
+	def setUp(self):
+		self.receipt = SaleReceipt.objects.create(customer_name="Amina")
+		self.payment = Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.PENDING,
+			checkout_request_id="checkout-reconcile",
+		)
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=10)
+		)
+
+	@patch("sales.management.commands.reconcile_mpesa.query_stk_push")
+	def test_successful_query_marks_payment_succeeded(self, query):
+		query.return_value = {"ResultCode": "0", "ResultDesc": "The service request is processed successfully."}
+
+		call_command("reconcile_mpesa", stdout=StringIO())
+
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.SUCCEEDED)
+
+	@patch("sales.management.commands.reconcile_mpesa.query_stk_push")
+	def test_timed_out_prompt_marks_payment_failed(self, query):
+		query.return_value = {"ResultCode": "1037", "ResultDesc": "DS timeout user cannot be reached"}
+
+		call_command("reconcile_mpesa", stdout=StringIO())
+
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.FAILED)
+
+	@patch("sales.management.commands.reconcile_mpesa.query_stk_push")
+	def test_dry_run_does_not_change_status(self, query):
+		query.return_value = {"ResultCode": "0", "ResultDesc": "Success"}
+
+		call_command("reconcile_mpesa", stdout=StringIO(), dry_run=True)
+
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+
+class TokenExpiryTests(TestCase):
+	def setUp(self):
+		self.user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.token = Token.objects.create(user=self.user)
+		self.client = APIClient()
+
+	@override_settings(AUTH_TOKEN_TTL_DAYS=30)
+	def test_expired_token_is_rejected_and_removed(self):
+		Token.objects.filter(pk=self.token.pk).update(
+			created=timezone.now() - timedelta(days=31)
+		)
+		self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token.key}")
+
+		response = self.client.get(reverse("product-list"))
+
+		self.assertEqual(response.status_code, 401)
+		self.assertFalse(Token.objects.filter(pk=self.token.pk).exists())
+
+	@override_settings(AUTH_TOKEN_TTL_DAYS=30)
+	def test_fresh_token_is_accepted(self):
+		self.client.credentials(HTTP_AUTHORIZATION=f"Token {self.token.key}")
+
+		response = self.client.get(reverse("product-list"))
+
+		self.assertEqual(response.status_code, 200)
+
+
+class AnalyticsWindowTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="cashier", password="test-password")
+		self.client.force_authenticate(user=user)
+
+	def test_weekly_income_covers_eight_monday_aligned_weeks(self):
+		response = self.client.get(reverse("sale-analytics"))
+
+		self.assertEqual(response.status_code, 200)
+		weeks = response.data["weekly_income"]
+		today = timezone.localdate()
+		current_monday = today - timedelta(days=today.weekday())
+
+		self.assertEqual(len(weeks), 8)
+		self.assertEqual(weeks[-1]["week_start"], current_monday.isoformat())
+		self.assertEqual(
+			weeks[0]["week_start"],
+			(current_monday - timedelta(weeks=7)).isoformat(),
+		)
+
+
+
+class MarkedPriceAndBranchTests(TestCase):
+	def setUp(self):
+		from accounts.models import Branch, StaffProfile
+		from expenses.models import Expense
+
+		self.Branch = Branch
+		self.StaffProfile = StaffProfile
+		self.Expense = Expense
+		self.main = Branch.objects.get(code="MAIN")
+		self.town = Branch.objects.create(name="Town branch", code="TOWN")
+
+		self.manager = get_user_model().objects.create_user(
+			username="town-manager", password="manager-pass-1", is_staff=True
+		)
+		StaffProfile.objects.create(user=self.manager, branch=self.town)
+		self.cashier = get_user_model().objects.create_user(
+			username="town-cashier", password="cashier-pass-1"
+		)
+		StaffProfile.objects.create(user=self.cashier, branch=self.town)
+
+		self.main_product = Product.objects.create(
+			name="Main rice", cost_price="100.00", selling_price="125.00", stock_quantity=20,
+		)
+		self.town_product = Product.objects.create(
+			name="Town rice", branch=self.town,
+			cost_price="100.00", selling_price="125.00", stock_quantity=20,
+		)
+
+	def test_sale_between_cost_and_retail_price_is_allowed(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "120.00"}],
+				"payments": [{"amount": "120.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		sale = Sale.objects.get()
+		self.assertEqual(sale.price_sold_at, Decimal("120.00"))
+		self.assertEqual(sale.profit, Decimal("20.00"))
+		self.assertEqual(SaleReceipt.objects.count(), 1)
+
+	def test_checkout_below_wholesale_cost_is_still_blocked(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "99.99"}],
+				"payments": [{"amount": "99.99", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("wholesale cost", str(response.data))
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+		self.assertEqual(Sale.objects.count(), 0)
+
+	def test_legacy_sale_endpoint_allows_discounts_above_cost(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-list"),
+			{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "110.00"},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(Sale.objects.count(), 1)
+
+	def test_cashier_checkout_records_branch_and_cashier(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.town_product.id), "quantity": 2, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "250.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		receipt = SaleReceipt.objects.get(pk=response.data["id"])
+		self.assertEqual(receipt.branch, self.town)
+		self.assertEqual(receipt.created_by, self.cashier)
+		self.assertEqual(receipt.payments.get().created_by, self.cashier)
+		self.assertEqual(response.data["created_by_name"], "town-cashier")
+
+	def test_cashier_may_send_their_own_branch_explicitly(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"branch": str(self.town.id),
+				"items": [{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(SaleReceipt.objects.get().branch, self.town)
+
+	def test_cashier_cannot_choose_another_branch(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"branch": str(self.main.id),
+				"items": [{"product": str(self.main_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 403)
+		self.assertEqual(SaleReceipt.objects.count(), 0)
+
+	def test_checkout_cannot_sell_another_branch_product(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.main_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("not stocked at", str(response.data))
+
+	def test_receipts_and_analytics_are_scoped_to_the_manager_branch(self):
+		cashier_client = APIClient()
+		cashier_client.force_authenticate(self.cashier)
+		town_checkout = cashier_client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "cash"}],
+			},
+			format="json",
+		)
+		main_checkout = APIClient()
+		main_cashier = get_user_model().objects.create_user(
+			username="main-cashier", password="cashier-pass-2"
+		)
+		main_checkout.force_authenticate(main_cashier)
+		main_response = main_checkout.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.main_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "125.00", "method": "cash"}],
+			},
+			format="json",
+		)
+
+		manager_client = APIClient()
+		manager_client.force_authenticate(self.manager)
+		receipts = manager_client.get(reverse("receipt-list"))
+		analytics = manager_client.get(reverse("sale-analytics"))
+		blocked_payment = manager_client.post(
+			reverse("receipt-payments", kwargs={"pk": main_response.data["id"]}),
+			{"amount": "1.00", "method": "cash"},
+			format="json",
+		)
+
+		self.assertEqual(receipts.status_code, 200)
+		self.assertEqual(receipts.data["count"], 1)
+		self.assertEqual(receipts.data["results"][0]["id"], town_checkout.data["id"])
+		self.assertEqual(analytics.status_code, 200)
+		self.assertEqual(analytics.data["total_sales"], Decimal("125.00"))
+		self.assertEqual(blocked_payment.status_code, 403)
+
+	def test_analytics_nets_expenses_out_of_profit(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+		client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [{"product": str(self.town_product.id), "quantity": 2, "price_sold_at": "125.00"}],
+				"payments": [{"amount": "250.00", "method": "cash"}],
+			},
+			format="json",
+		)
+		self.Expense.objects.create(
+			date=timezone.localdate(), category="rent", description="Rent",
+			amount=Decimal("15.00"), branch=self.town,
+		)
+
+		cashier_view = client.get(reverse("sale-analytics"))
+		manager_view = APIClient()
+		manager_view.force_authenticate(self.manager)
+		response = manager_view.get(reverse("sale-analytics"))
+
+		self.assertIsNone(cashier_view.data["gross_profit"])
+		self.assertIsNone(cashier_view.data["total_expenses"])
+		self.assertEqual(response.data["gross_profit"], Decimal("50.00"))
+		self.assertEqual(response.data["total_expenses"], Decimal("15.00"))
+		self.assertEqual(response.data["net_profit"], Decimal("35.00"))
+
+	def test_transactions_csv_export_contains_receipts(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+		client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"items": [{"product": str(self.town_product.id), "quantity": 1, "price_sold_at": "125.00"}],
+			},
+			format="json",
+		)
+
+		response = client.get(reverse("receipt-export"))
+
+		self.assertEqual(response.status_code, 200)
+		self.assertIn("text/csv", response["Content-Type"])
+		body = response.content.decode("utf-8-sig")
+		self.assertIn("Amina", body)
+		self.assertIn("Town branch", body)

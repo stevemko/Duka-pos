@@ -1,0 +1,227 @@
+from decimal import Decimal
+from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase
+from django.urls import reverse
+from rest_framework.test import APIClient
+from .models import Product
+
+
+class ProductCostEntryTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		self.user = get_user_model().objects.create_user(
+			username="owner", password="test-password", is_staff=True
+		)
+		self.client.force_authenticate(user=self.user)
+
+	def test_product_api_requires_authentication(self):
+		response = APIClient().get(reverse("product-list"))
+
+		self.assertEqual(response.status_code, 401)
+
+	def test_owner_can_log_in_and_receive_an_api_token(self):
+		response = APIClient().post(
+			reverse("api-login"),
+			{"username": "owner", "password": "test-password"},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertTrue(response.data["token"])
+
+	def test_product_can_be_created_with_cost_without_catalog_selling_price(self):
+		response = self.client.post(
+			reverse("product-list"),
+			{"name": "Cooking oil", "cost_price": "180.00", "stock_quantity": 8},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201)
+		product = Product.objects.get(pk=response.data["id"])
+		self.assertEqual(product.cost_price, Decimal("180.00"))
+		self.assertEqual(product.selling_price, Decimal("180.00"))
+
+	def test_non_staff_user_cannot_create_products(self):
+		cashier = get_user_model().objects.create_user(
+			username="cashier", password="test-password"
+		)
+		client = APIClient()
+		client.force_authenticate(user=cashier)
+
+		response = client.post(
+			reverse("product-list"),
+			{"name": "Cooking oil", "cost_price": "180.00", "stock_quantity": 8},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 403)
+
+	def test_deleting_a_product_with_sales_returns_conflict(self):
+		product = Product.objects.create(
+			name="Cooking oil", cost_price=Decimal("180.00"),
+			selling_price=Decimal("200.00"), stock_quantity=3,
+		)
+		from sales.models import Sale, SaleReceipt
+
+		receipt = SaleReceipt.objects.create()
+		Sale.objects.create(
+			receipt=receipt, product=product, quantity=1,
+			price_sold_at=Decimal("200.00"),
+		)
+
+		response = self.client.delete(reverse("product-detail", args=[product.pk]))
+
+		self.assertEqual(response.status_code, 409)
+		self.assertTrue(Product.objects.filter(pk=product.pk).exists())
+
+	def test_invalid_image_content_is_rejected(self):
+		upload = SimpleUploadedFile("fake.png", b"not really an image", content_type="image/png")
+
+		response = self.client.post(
+			reverse("product-list"),
+			{
+				"name": "LED bulb",
+				"cost_price": "100.00",
+				"selling_price": "150.00",
+				"stock_quantity": 4,
+				"image": upload,
+			},
+			format="multipart",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("image", response.data)
+		self.assertEqual(Product.objects.count(), 0)
+
+	def test_selling_price_below_cost_is_rejected(self):
+		response = self.client.post(
+			reverse("product-list"),
+			{"name": "LED bulb", "cost_price": "100.00", "selling_price": "90.00", "stock_quantity": 4},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("selling_price", response.data)
+
+
+class ProductCatalogTests(TestCase):
+	def setUp(self):
+		from accounts.models import Branch
+
+		self.branch = Branch.objects.get_or_create(
+			code="MAIN", defaults={"name": "Main shop"}
+		)[0]
+		self.manager = get_user_model().objects.create_user(
+			username="manager", password="test-password", is_staff=True
+		)
+		self.cashier = get_user_model().objects.create_user(
+			username="cashier", password="test-password"
+		)
+		self.client = APIClient()
+		self.client.force_authenticate(self.manager)
+		self.bulb = Product.objects.create(
+			name="LED bulb 9W", sku="LED-9W", category="Bulbs",
+			cost_price="180.00", selling_price="250.00", stock_quantity=3, reorder_threshold=5,
+		)
+		self.spot = Product.objects.create(
+			name="LED spotlight", sku="SPOT-12", category="Spotlights",
+			cost_price="400.00", selling_price="600.00", stock_quantity=40, reorder_threshold=5,
+		)
+		self.mirror = Product.objects.create(
+			name="Side mirror", sku="MIR-01", category="Mirrors",
+			cost_price="300.00", selling_price="450.00", stock_quantity=8, reorder_threshold=2,
+		)
+
+	def test_search_category_and_low_stock_filters(self):
+		by_search = self.client.get(reverse("product-list"), {"q": "spot"})
+		by_sku = self.client.get(reverse("product-list"), {"sku": "mir-01"})
+		by_category = self.client.get(reverse("product-list"), {"category": "Mirrors"})
+		low = self.client.get(reverse("product-list"), {"low": "1"})
+
+		self.assertEqual(by_search.data["count"], 1)
+		self.assertEqual(by_search.data["results"][0]["name"], "LED spotlight")
+		self.assertEqual(by_sku.data["count"], 1)
+		self.assertEqual(by_sku.data["results"][0]["name"], "Side mirror")
+		self.assertEqual(by_category.data["count"], 1)
+		self.assertEqual(low.data["count"], 1)
+		self.assertEqual(low.data["results"][0]["name"], "LED bulb 9W")
+
+	def test_pagination_respects_page_size(self):
+		response = self.client.get(reverse("product-list"), {"page": 2, "page_size": 2})
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["count"], 3)
+		self.assertEqual(len(response.data["results"]), 1)
+		self.assertTrue(response.data["next"] is None)
+
+	def test_categories_and_overview(self):
+		categories = self.client.get(reverse("product-categories"))
+		overview = self.client.get(reverse("product-overview"))
+
+		self.assertEqual(categories.status_code, 200)
+		self.assertEqual(
+			[{"category": row["category"], "products": row["products"]} for row in categories.data],
+			[
+				{"category": "Bulbs", "products": 1},
+				{"category": "Mirrors", "products": 1},
+				{"category": "Spotlights", "products": 1},
+			],
+		)
+		self.assertEqual(overview.data["products"], 3)
+		self.assertEqual(overview.data["units"], 51)
+		self.assertEqual(overview.data["low"], 1)
+		self.assertEqual(overview.data["cost_value"], Decimal("180.00") * 3 + Decimal("400.00") * 40 + Decimal("300.00") * 8)
+		self.assertEqual(overview.data["retail_value"], Decimal("250.00") * 3 + Decimal("600.00") * 40 + Decimal("450.00") * 8)
+
+	def test_cashier_sees_price_floor_but_not_wholesale_cost(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+
+		response = client.get(reverse("product-list"))
+		row = next(item for item in response.data["results"] if item["id"] == str(self.bulb.id))
+
+		self.assertNotIn("cost_price", row)
+		self.assertEqual(Decimal(str(row["price_floor"])), Decimal("180.00"))
+		self.assertEqual(Decimal(str(row["selling_price"])), Decimal("250.00"))
+
+		overview = client.get(reverse("product-overview"))
+		self.assertIsNone(overview.data["cost_value"])
+		self.assertEqual(
+			overview.data["retail_value"],
+			Decimal("250.00") * 3 + Decimal("600.00") * 40 + Decimal("450.00") * 8,
+		)
+
+	def test_csv_import_creates_products_and_reports_bad_rows(self):
+		csv_body = (
+			"name,sku,category,cost_price,selling_price,stock_quantity,reorder_threshold\n"
+			"LED strip,STRIP-1,Strips,100.00,160.00,20,5\n"
+			"Bad row,BAD-1,Strips,100.00,90.00,5,2\n"
+			"Bad number,NUM-1,Strips,abc,100.00,5,2\n"
+			"Duplicate,LED-9W,Bulbs,10.00,20.00,1,1\n"
+			"\n"
+		)
+		upload = SimpleUploadedFile("products.csv", csv_body.encode("utf-8"), content_type="text/csv")
+
+		response = self.client.post(reverse("product-import"), {"file": upload}, format="multipart")
+
+		self.assertEqual(response.status_code, 201)
+		self.assertEqual(response.data["created"], 1)
+		self.assertEqual(response.data["error_count"], 3)
+		self.assertTrue(Product.objects.filter(sku="STRIP-1").exists())
+		stripped = Product.objects.get(sku="STRIP-1")
+		self.assertEqual(stripped.selling_price, Decimal("160.00"))
+		self.assertEqual(stripped.stock_quantity, 20)
+
+	def test_cashier_cannot_import_products(self):
+		client = APIClient()
+		client.force_authenticate(self.cashier)
+		upload = SimpleUploadedFile(
+			"products.csv",
+			b"name,cost_price\nNope,10.00\n",
+			content_type="text/csv",
+		)
+
+		response = client.post(reverse("product-import"), {"file": upload}, format="multipart")
+
+		self.assertEqual(response.status_code, 403)
