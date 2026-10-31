@@ -1,9 +1,8 @@
-@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap");
 @import "tailwindcss";
 
 @theme {
-	--font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
-	--font-display: "Space Grotesk", "Manrope", ui-sans-serif, sans-serif;
+	--font-sans: "Manrope Variable", "Manrope", ui-sans-serif, system-ui, sans-serif;
+	--font-display: "Space Grotesk Variable", "Space Grotesk", "Manrope Variable", ui-sans-serif, sans-serif;
 
 	--color-brand-50: #ecfdf5;
 	--color-brand-100: #d1fae5;

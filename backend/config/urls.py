@@ -15,10 +15,9 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.conf import settings
-from django.conf.urls.static import static
-from django.urls import path, include
+from django.urls import include, path, re_path
 from .auth_views import api_login, api_logout, shop_info
+from .views import media_file, spa_index
 from accounts.views import ChangePasswordView, MeView
 
 urlpatterns = [
@@ -33,7 +32,10 @@ urlpatterns = [
     path('api/', include('sales.urls')),
     path('api/', include('alerts.urls')),
     path('api/', include('expenses.urls')),
+    # Product photos live on disk, so they are served the same way whether or not
+    # DEBUG is on - a shop machine has no nginx sitting in front to take them.
+    re_path(r"^media/(?P<relpath>.+)$", media_file, name="media"),
+    # Everything else belongs to the React app. /sw.js has to be served from the
+    # origin root or the service worker cannot control the rest of the site.
+    re_path(r"^(?!api/|admin/|media/|static/).*$", spa_index, name="spa"),
 ]
-
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

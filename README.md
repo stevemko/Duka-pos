@@ -207,7 +207,50 @@ passkey in Daraja before go-live, then update `.env`.
 
 ## Deployment
 
-### Recommended: VPS + PostgreSQL + nginx + gunicorn
+### One computer in the shop (this is the usual setup)
+
+The backend serves the built app, the API and the product photos from one port,
+so there is no nginx and no second machine to administer. Trading does not need
+the internet; only M-Pesa prompts do.
+
+```bat
+cd frontend
+npm install
+npm run build
+
+cd ..\backend
+python -m venv backend_venv
+backend_venv\Scripts\python -m pip install -r requirements.txt
+backend_venv\Scripts\python manage.py createsuperuser
+start-shop.bat
+```
+
+`start-shop.bat` applies any pending migrations and then serves port 8000 on
+every network address of that machine, so the other tills in the shop open
+`http://<that computer's name or its 192.168.x.x address>:8000`. Windows asks
+once whether to allow it - choose allow on **Private** networks.
+
+Notes for this setup:
+
+- Keep `DEBUG=False` in `backend/.env` and never put the built `dist` folder on
+  OneDrive or Google Drive while trading.
+- The machine's own IP addresses and its computer name are added to
+  `ALLOWED_HOSTS` automatically, so the LAN address works without editing `.env`.
+- `SESSION_COOKIE_SECURE` and `CSRF_COOKIE_SECURE` stay `False` on plain
+  `http://192.168.x.x`; a Secure cookie is never sent there and would lock the
+  admin out. Turn both on the day the shop gets HTTPS.
+- If the browser shows "The shop app has not been built yet", `frontend/dist` is
+  missing - run `npm run build` in `frontend`.
+
+Install it as an app on each till: open the address in Chrome or Edge, then the
+**Install app** / **Install this site as an app** icon in the address bar (or
+the three-dot menu). That gives a desktop icon and its own window. After the
+first full sign-in, the till's screen and product photos load even if the shop's
+internet or the server link drops - stock, prices and payments always come from
+the server, so an unreachable server means "cannot sell right now", never a
+stale answer.
+
+### VPS + PostgreSQL + nginx + gunicorn (only if the shop wants a public URL)
 
 1. Install Python 3.14, PostgreSQL and nginx on the server.
 2. Create the database and a dedicated OS user, then clone the project.

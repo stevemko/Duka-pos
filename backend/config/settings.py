@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
+import socket
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -32,6 +33,26 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 
 ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='localhost,127.0.0.1', cast=Csv())
 CSRF_TRUSTED_ORIGINS = config('CSRF_TRUSTED_ORIGINS', default='', cast=Csv())
+
+
+def machine_addresses():
+    """Addresses this machine is actually known by, for ALLOWED_HOSTS.
+
+    The till is opened as http://192.168.x.x from the other counters in the shop,
+    and an unlisted address answers with a bare 400 that says nothing to a
+    cashier. Only addresses bound to this host are added, so this cannot widen
+    the door for anyone outside the room.
+    """
+    found = {socket.gethostname(), socket.gethostname().lower()}
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            found.add(info[4][0])
+    except OSError:
+        pass
+    return found
+
+
+ALLOWED_HOSTS = list(dict.fromkeys(ALLOWED_HOSTS + sorted(machine_addresses())))
 
 
 # Application definition
@@ -194,6 +215,15 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# The built React app. Whitenoise serves it from the site root so one process on
+# one port gives the shop the UI, the API and the product images; the service
+# worker has to be reachable at /sw.js for it to control the whole origin.
+FRONTEND_DIST = BASE_DIR.parent / 'frontend' / 'dist'
+WHITENOISE_ROOT = FRONTEND_DIST
+# Python has no built-in type for a web app manifest and browsers reject a
+# manifest served as anything but JSON, so name it here rather than hope.
+WHITENOISE_MIMETYPES = {'.webmanifest': 'application/manifest+json'}
+
 STORAGES = {
     'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
     'staticfiles': {
@@ -214,8 +244,10 @@ EMAIL_BACKEND = config(
 
 # Security. TLS is expected to terminate at the reverse proxy in front of Django.
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
-CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
+# A shop server is addressed as http://192.168.x.x, where a Secure cookie is never
+# sent and the admin would lock itself out. Turn these on if the shop adds HTTPS.
+SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=False, cast=bool)
+CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=False, cast=bool)
 SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=False, cast=bool)
 SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000 if not DEBUG else 0, cast=int)
 SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=not DEBUG, cast=bool)
