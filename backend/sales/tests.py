@@ -12,6 +12,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from products.models import Product
 from .models import Payment, Sale, SaleReceipt
+from .mpesa import MpesaError
 
 
 class SaleStockTests(TestCase):
@@ -472,6 +473,33 @@ class CartCheckoutTests(TestCase):
 		self.assertEqual(response.data["receipt"]["payments"][0]["status"], "pending")
 		self.assertEqual(Payment.objects.get().checkout_request_id, "checkout-1")
 
+	@patch("sales.views.initiate_stk_push")
+	def test_cash_over_an_open_prompt_settles_the_receipt(self, initiate):
+		initiate.return_value = {
+			"ResponseCode": "0",
+			"MerchantRequestID": "merchant-1",
+			"CheckoutRequestID": "checkout-1",
+			"CustomerMessage": "Prompt sent",
+		}
+		receipt_id = self.create_credit_receipt().data["id"]
+		self.client.post(reverse("receipt-stk-push", kwargs={"pk": receipt_id}), {"phone": "0794671494"}, format="json")
+
+		payment_response = self.client.post(
+			reverse("receipt-payments", kwargs={"pk": receipt_id}),
+			{"amount": "125.00", "method": "cash"},
+			format="json",
+		)
+		check_response = self.client.post(
+			reverse("receipt-check-payment", kwargs={"pk": receipt_id}), {}, format="json"
+		)
+
+		self.assertEqual(payment_response.data["payment_status"], "paid")
+		self.assertEqual(check_response.data["state"], "paid")
+		listed = self.client.get(reverse("receipt-list"), {"status": "paid"}, format="json")
+		self.assertEqual(
+			[entry["id"] for entry in listed.data["results"]], [str(receipt_id)]
+		)
+
 	@patch("sales.views.config", return_value="test-callback-token")
 	@patch("sales.views.initiate_stk_push")
 	def test_successful_mpesa_callback_marks_payment_paid(self, initiate, _callback_config):
@@ -770,6 +798,120 @@ class ReconcileMpesaCommandTests(TestCase):
 
 		self.payment.refresh_from_db()
 		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+	@patch("sales.management.commands.reconcile_mpesa.query_stk_push")
+	def test_successful_query_records_the_mpesa_receipt_code(self, query):
+		query.return_value = {
+			"ResultCode": "0",
+			"ResultDesc": "The service request is processed successfully.",
+			"CallbackMetadata": {
+				"Item": [{"Name": "MpesaReceiptNumber", "Value": "SLK7XYZ12A"}]
+			},
+		}
+
+		call_command("reconcile_mpesa", stdout=StringIO())
+
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.reference, "SLK7XYZ12A")
+
+
+class CheckPaymentStatusTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(
+			username="till", password="test-password", is_staff=True
+		)
+		self.client.force_authenticate(user)
+		self.product = Product.objects.create(
+			name="Rice", sku="CHECK-RICE", cost_price="100.00",
+			selling_price="125.00", stock_quantity=10,
+		)
+		self.receipt = SaleReceipt.objects.create(customer_name="Amina")
+		Sale.objects.create(
+			receipt=self.receipt, product=self.product, quantity=1,
+			price_sold_at=Decimal("125.00"),
+		)
+		self.payment = Payment.objects.create(
+			receipt=self.receipt, amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK, status=Payment.Status.PENDING,
+			checkout_request_id="checkout-check",
+		)
+
+	def check(self):
+		return self.client.post(
+			reverse("receipt-check-payment", kwargs={"pk": self.receipt.pk}), {}, format="json"
+		)
+
+	@patch("sales.views.query_stk_push")
+	def test_confirmed_prompt_reports_paid_with_the_mpesa_code(self, query):
+		query.return_value = {
+			"ResultCode": "0",
+			"ResultDesc": "The service request is processed successfully.",
+			"CallbackMetadata": {
+				"Item": [
+					{"Name": "Amount", "Value": 125},
+					{"Name": "MpesaReceiptNumber", "Value": "SLK9C1P2QX"},
+				]
+			},
+		}
+
+		response = self.check()
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["state"], "paid")
+		self.assertEqual(response.data["mpesa_code"], "SLK9C1P2QX")
+		self.assertEqual(response.data["receipt"]["balance"], "0.00")
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.SUCCEEDED)
+
+	@patch("sales.views.query_stk_push")
+	def test_pin_never_entered_reports_not_paid(self, query):
+		query.return_value = {
+			"ResultCode": "1032",
+			"ResultDesc": "Request timed out. Customer never entered the PIN.",
+		}
+
+		response = self.check()
+
+		self.assertEqual(response.data["state"], "not_paid")
+		self.assertEqual(response.data["balance"], "125.00")
+		self.assertIn("never entered the PIN", response.data["result_description"])
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.FAILED)
+
+	@patch("sales.views.query_stk_push")
+	def test_prompt_the_customer_has_not_answered_yet_reports_waiting(self, query):
+		query.return_value = {"ResultCode": "2025", "ResultDesc": ""}
+
+		response = self.check()
+
+		self.assertEqual(response.data["state"], "waiting")
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+	@patch("sales.views.query_stk_push")
+	def test_unreachable_daraja_leaves_the_prompt_pending(self, query):
+		query.side_effect = MpesaError("Could not reach Safaricom. The payment request was not confirmed.")
+
+		response = self.check()
+
+		self.assertEqual(response.data["state"], "waiting")
+		self.assertIn("Could not reach Safaricom", response.data["note"])
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+	@patch("sales.views.query_stk_push")
+	def test_expired_prompt_is_reported_without_calling_daraja(self, query):
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=10)
+		)
+
+		response = self.check()
+
+		self.assertEqual(response.data["state"], "not_paid")
+		query.assert_not_called()
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.FAILED)
 
 
 class TokenExpiryTests(TestCase):

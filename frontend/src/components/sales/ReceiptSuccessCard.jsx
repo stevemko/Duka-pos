@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import Icon from "../Icon";
-import { Badge, Button, Card, cn } from "../ui";
+import PaymentStatusBanner from "./PaymentStatusBanner";
+import { Badge, Button, Card } from "../ui";
 import { money } from "../../lib/format";
 
 export default function ReceiptSuccessCard({
@@ -9,11 +10,19 @@ export default function ReceiptSuccessCard({
   onPrint,
   onStk,
   onSettle,
-  stkStatus,
+  payment,
+  checkingPayment,
+  onCheckPayment,
 }) {
   if (!receipt) return null;
   const balance = Number(receipt.balance);
   const account = receipt.id.slice(0, 8).toUpperCase();
+  const statusLabels = {
+    paid: "Paid",
+    payment_pending: "Waiting for M-Pesa",
+    partially_paid: "Part paid",
+    on_credit: "On credit - not paid",
+  };
 
   return (
     <Card className="animate-rise border-brand-200 bg-brand-50/50 p-4">
@@ -26,7 +35,7 @@ export default function ReceiptSuccessCard({
           </p>
         </div>
         <Badge tone={receipt.payment_status === "paid" ? "success" : "warning"}>
-          {receipt.payment_status.replaceAll("_", " ")}
+          {statusLabels[receipt.payment_status] || receipt.payment_status}
         </Badge>
       </div>
 
@@ -77,16 +86,18 @@ export default function ReceiptSuccessCard({
         </Link>
       </div>
 
-      {stkStatus && (
-        <p
-          className={cn(
-            "mt-2 text-xs",
-            stkStatus.type === "error" ? "text-red-700" : "text-emerald-800",
-          )}
-        >
-          {stkStatus.message}
-        </p>
-      )}
+      <div className="mt-3">
+        <PaymentStatusBanner
+          status={payment}
+          checking={checkingPayment}
+          onCheck={balance > 0 ? onCheckPayment : null}
+          onSendAgain={
+            payment?.state === "not_paid" || payment?.state === "unknown" || payment?.state === "not_sent"
+              ? () => onStk(receipt)
+              : null
+          }
+        />
+      </div>
     </Card>
   );
 }

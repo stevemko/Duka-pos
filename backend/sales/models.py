@@ -107,6 +107,11 @@ class SaleReceipt(models.Model):
 
     @property
     def payment_status(self):
+        # Money that already covers the bill wins over an open prompt: a customer
+        # who pays cash while their M-Pesa request still sits on the phone has
+        # paid, and the till must not keep saying "waiting".
+        if self.balance <= 0:
+            return "paid"
         if hasattr(self, "annotated_pending_count"):
             has_active_pending = self.annotated_pending_count > 0
         else:
@@ -116,8 +121,6 @@ class SaleReceipt(models.Model):
             ).exists()
         if has_active_pending:
             return "payment_pending"
-        if self.balance <= 0:
-            return "paid"
         if self.amount_paid > 0:
             return "partially_paid"
         return "on_credit"

@@ -2,6 +2,7 @@ import csv
 import io
 from decimal import Decimal, InvalidOperation
 
+from django.db import transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, ProtectedError, Q, Sum
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
@@ -12,7 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from accounts.models import Branch
-from accounts.permissions import IsManager
+from accounts.permissions import IsManager, IsSuperUser
 from accounts.services import (
     branch_queryset,
     main_branch,
@@ -128,6 +129,60 @@ class ProductViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+    @staticmethod
+    def _shop_key(product):
+        """Legacy products stored without a branch row still belong to the main shop."""
+        if product.branch_id:
+            return product.branch_id
+        main = main_branch()
+        return main.pk if main and main.code == "MAIN" else None
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsSuperUser])
+    def merge(self, request, pk=None):
+        """Collapse a product entered twice under different names into the one to keep."""
+        source = self.get_object()
+        target_pk = (request.data.get("target") or "").strip()
+        if not target_pk:
+            raise ValidationError({"target": "Choose the product to keep."})
+
+        target = Product.objects.filter(pk=target_pk).first()
+        if target is None:
+            raise ValidationError({"target": "Unknown product."})
+        if target.pk == source.pk:
+            raise ValidationError({"target": "Choose a different product to keep."})
+        if self._shop_key(source) != self._shop_key(target):
+            raise ValidationError({"target": "Both products must belong to the same shop."})
+
+        with transaction.atomic():
+            locked = {
+                product.pk: product
+                for product in Product.objects.select_for_update()
+                .filter(pk__in=[source.pk, target.pk])
+                .order_by("id")
+            }
+            source, target = locked[source.pk], locked[target.pk]
+            sales_moved = source.sales.update(product=target)
+            stock_moved = source.stock_quantity
+            if stock_moved:
+                target.stock_quantity += stock_moved
+                target.save(update_fields=["stock_quantity", "updated_at"])
+            # Restock alerts for the duplicate are dropped with it; the next sale
+            # re-triggers one against the product that was kept.
+            source.delete()
+
+        payload = {
+            "merged_name": source.name,
+            "into": ProductSerializer(target, context={"request": request}).data,
+            "sales_moved": sales_moved,
+            "stock_moved": stock_moved,
+        }
+        if (source.cost_price, source.selling_price) != (target.cost_price, target.selling_price):
+            payload["price_note"] = (
+                "The moved stock is now priced as the kept product. Update its prices "
+                "if the two entries were bought or sold at different rates."
+            )
+        return Response(payload)
 
     @action(detail=False, methods=["get"])
     def low_stock(self, request):

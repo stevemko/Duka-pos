@@ -140,6 +140,11 @@ if DATABASE_URL:
     DATABASES = {
         'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
     }
+    # dj_database_url drops OPTIONS, so a SQLite URL supplied through the
+    # environment would lose the busy timeout and fail with "database is locked"
+    # the moment two counter writes overlap.
+    if DATABASES['default']['ENGINE'].endswith('sqlite3'):
+        DATABASES['default'].setdefault('OPTIONS', {})['timeout'] = 20
 else:
     DATABASES = {
         'default': {

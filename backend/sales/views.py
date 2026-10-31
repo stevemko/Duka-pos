@@ -39,7 +39,13 @@ from expenses.models import Expense
 from products.models import Product
 
 from .models import Payment, Sale, SaleReceipt, stk_pending_cutoff
-from .mpesa import MpesaError, initiate_stk_push, normalize_phone
+from .mpesa import (
+    MpesaError,
+    apply_query_result,
+    initiate_stk_push,
+    normalize_phone,
+    query_stk_push,
+)
 from .serializers import (
     CheckoutSerializer,
     ReceiptPaymentSerializer,
@@ -553,10 +559,10 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
             )
 
         status_filter = params.get("status")
+        # Mirrors SaleReceipt.payment_status so a tab count and the badge on the row
+        # can never disagree: settled bills are paid even with a prompt still open.
         if status_filter == "paid":
-            queryset = queryset.filter(
-                annotated_pending_count=0, annotated_amount_paid__gte=F("annotated_total")
-            )
+            queryset = queryset.filter(annotated_amount_paid__gte=F("annotated_total"))
         elif status_filter == "partially_paid":
             queryset = queryset.filter(
                 annotated_pending_count=0,
@@ -570,7 +576,10 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
                 annotated_total__gt=0,
             )
         elif status_filter == "payment_pending":
-            queryset = queryset.filter(annotated_pending_count__gt=0)
+            queryset = queryset.filter(
+                annotated_pending_count__gt=0,
+                annotated_amount_paid__lt=F("annotated_total"),
+            )
         elif status_filter:
             raise ValidationError({"status": "Use paid, partially_paid, on_credit or payment_pending."})
         return queryset
@@ -702,6 +711,82 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
             "amount": str(stk_amount),
             "receipt": SaleReceiptSerializer(receipt).data,
         }, status=status.HTTP_202_ACCEPTED)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="check-payment",
+        throttle_classes=[PaymentThrottle],
+    )
+    def check_payment(self, request, pk=None):
+        """Settle an M-Pesa prompt the callback never finished and report the outcome."""
+        with transaction.atomic():
+            receipt = SaleReceipt.objects.select_for_update().get(pk=pk)
+            _assert_receipt_access(request.user, receipt)
+            receipt.expire_stale_stk_payments()
+            pending = receipt.payments.filter(
+                method=Payment.Method.MPESA_STK,
+                status=Payment.Status.PENDING,
+            ).order_by("-created_at").first()
+            if pending and not pending.checkout_request_id:
+                pending.status = Payment.Status.FAILED
+                pending.result_description = (
+                    "Timed out before Safaricom returned a checkout request ID."
+                )
+                pending.save(update_fields=["status", "result_description"])
+                pending = None
+
+        note = ""
+        if pending is not None:
+            # Daraja is asked outside the lock so a slow reply never holds up the
+            # rest of the counter.
+            try:
+                outcome, description, reference = apply_query_result(
+                    pending, query_stk_push(pending)
+                )
+            except MpesaError as error:
+                note = str(error)
+            else:
+                if outcome is None:
+                    note = description
+                else:
+                    with transaction.atomic():
+                        # Re-read: the callback may have landed while querying Daraja.
+                        payment = Payment.objects.select_for_update().get(pk=pending.pk)
+                        if payment.status == Payment.Status.PENDING:
+                            payment.status = outcome
+                            payment.result_description = description
+                            fields = ["status", "result_description"]
+                            if reference and not payment.reference:
+                                payment.reference = reference
+                                fields.append("reference")
+                            payment.save(update_fields=fields)
+
+        fresh = _receipt_queryset().get(pk=pk)
+        data = SaleReceiptSerializer(fresh).data
+        prompts = [
+            entry for entry in data["payments"]
+            if entry["method"] == Payment.Method.MPESA_STK
+        ]
+        latest = prompts[-1] if prompts else None
+        payment_status = data["payment_status"]
+
+        if payment_status == "paid":
+            state = "paid"
+        elif payment_status == "payment_pending":
+            state = "waiting"
+        else:
+            state = "not_paid"
+
+        return Response({
+            "state": state,
+            "balance": data["balance"],
+            "amount_paid": data["amount_paid"],
+            "mpesa_code": (latest or {}).get("reference", ""),
+            "result_description": (latest or {}).get("result_description", ""),
+            "note": note,
+            "receipt": data,
+        })
 
     @action(
         detail=True,

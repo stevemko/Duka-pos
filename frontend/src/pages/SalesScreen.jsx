@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { productsApi, receiptsApi, salesApi, apiErrorMessage } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
-import { fromCents, toCents } from "../lib/format";
+import { fromCents, money, toCents } from "../lib/format";
 import PrintableReceipt from "../components/PrintableReceipt";
 import { Alert, Badge, Select } from "../components/ui";
 import ProductPicker from "../components/sales/ProductPicker";
@@ -14,6 +14,15 @@ import SettlePaymentModal from "../components/sales/SettlePaymentModal";
 
 const PAGE_SIZE = 40;
 const DRAFT_KEY = "duka_pos_draft_sale";
+
+const SETTLED_LABELS = {
+  cash: "Cash",
+  mobile_money: "Mobile money",
+  mpesa_stk: "M-Pesa",
+  mpesa_paybill: "M-Pesa Paybill",
+  card: "Card",
+  bank_transfer: "Bank transfer",
+};
 
 // A half-entered sale is real work: the counter must not lose it to a page
 // refresh, an idle sign-out or a lost connection.
@@ -28,6 +37,17 @@ function readSavedDraft() {
 
 function floorOf(product) {
   return Number(product?.price_floor ?? product?.cost_price ?? 0);
+}
+
+// Daraja replies with terse internal phrasing such as "DS timeout user cannot be
+// reached", which reads like a system log to a cashier.
+function safaricomReason(text) {
+  const cleaned = String(text || "")
+    .replace(/^ds\s+/i, "")
+    .trim()
+    .replace(/\.+$/, "");
+  if (!cleaned) return "";
+  return `${cleaned.charAt(0).toUpperCase()}${cleaned.slice(1)}.`;
 }
 
 export default function SalesScreen() {
@@ -58,11 +78,13 @@ export default function SalesScreen() {
   const [manualBranch, setManualBranch] = useState("");
   const [stkTarget, setStkTarget] = useState(null);
   const [stkPhone, setStkPhone] = useState("");
-  const [stkStatus, setStkStatus] = useState(null);
+  const [payStatus, setPayStatus] = useState(null);
   const [sendingStk, setSendingStk] = useState(false);
+  const [checkingPay, setCheckingPay] = useState(false);
   const [settleTarget, setSettleTarget] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const checkoutKeyRef = useRef("");
+  const payTimerRef = useRef(0);
   const requestId = useRef(0);
 
   const fallbackBranchId = branches.find((branch) => branch.is_active)?.id || "";
@@ -159,11 +181,15 @@ export default function SalesScreen() {
     // app loading rather than the cashier switching shop. Clearing here would
     // also wipe a basket restored from the saved draft.
     if (!previous || previous === sellingBranchId) return;
+    stopPayWatch();
     setCart([]);
     setLastReceipt(null);
     setStatus(null);
+    setPayStatus(null);
     checkoutKeyRef.current = "";
   }, [sellingBranchId]);
+
+  useEffect(() => stopPayWatch, []);
 
   const loadRecentReceipts = useCallback(async () => {
     try {
@@ -463,76 +489,142 @@ export default function SalesScreen() {
 
   function askStk(receipt, amount, phone) {
     if (!(amount > 0)) return;
-    setStkStatus(null);
     setStkPhone(phone ?? receipt.customer_phone ?? "");
     setStkTarget({ receipt, amount });
+    // Keep an earlier verdict for the same receipt on screen; a prompt for a new
+    // receipt starts with a clean slate.
+    setPayStatus((current) => (current?.receiptId === receipt.id ? current : null));
   }
 
   async function sendStk() {
     if (!stkTarget) return;
+    const receiptId = stkTarget.receipt.id;
     if (!stkPhone.trim()) {
-      setStkStatus({ type: "error", message: "Enter the M-Pesa phone number." });
+      setPayStatus({
+        receiptId,
+        state: "not_sent",
+        balance: Number(stkTarget.amount || stkTarget.receipt.balance || 0),
+        code: "",
+        message: "Enter the M-Pesa phone number, then send the prompt.",
+      });
       return;
     }
     setSendingStk(true);
-    setStkStatus(null);
     try {
-      const response = await receiptsApi.stkPush(stkTarget.receipt.id, {
+      const response = await receiptsApi.stkPush(receiptId, {
         phone: stkPhone.trim(),
         amount: Number(stkTarget.amount).toFixed(2),
-      });
-      setStkStatus({
-        type: "success",
-        message: `${response.message} Ask the customer to enter their M-Pesa PIN.`,
       });
       setRecentReceipts((list) => [
         response.receipt,
         ...list.filter((entry) => entry.id !== response.receipt.id),
       ]);
       if (lastReceipt?.id === response.receipt.id) setLastReceipt(response.receipt);
-      pollStk(response.receipt.id);
+      setPayStatus({
+        receiptId,
+        state: "waiting",
+        balance: Number(response.receipt.balance),
+        code: "",
+        message: `Prompt sent to ${stkPhone.trim()}. ${response.message} The customer must enter their M-Pesa PIN and press OK on their own phone.`,
+      });
+      watchPayment(receiptId);
     } catch (error) {
-      setStkStatus({
-        type: "error",
-        message: apiErrorMessage(error, "Could not send the M-Pesa prompt."),
+      setPayStatus({
+        receiptId,
+        state: "not_sent",
+        balance: Number(stkTarget.amount || stkTarget.receipt.balance || 0),
+        code: "",
+        message: `${apiErrorMessage(error, "Could not send the M-Pesa prompt.")} Nothing has been charged.`,
       });
     } finally {
       setSendingStk(false);
     }
   }
 
-  function pollStk(receiptId, attempt = 0) {
-    if (attempt >= 12) {
-      setStkStatus({
-        type: "success",
-        message: "Still waiting for M-Pesa. Check Transactions shortly for the confirmed payment.",
-      });
-      return;
+  function describePayment(receiptId, outcome) {
+    const balance = Number(outcome.balance || 0);
+    const reason = safaricomReason(outcome.note || outcome.result_description);
+
+    if (outcome.state === "paid") {
+      return {
+        receiptId,
+        state: "paid",
+        balance: 0,
+        code: outcome.mpesa_code || "",
+        message: `KES ${money(outcome.amount_paid)} received. Hand over the goods and print the receipt.`,
+      };
     }
-    window.setTimeout(async () => {
-      try {
-        const receipt = await receiptsApi.get(receiptId);
-        setRecentReceipts((list) =>
-          list.map((entry) => (entry.id === receipt.id ? receipt : entry)),
+    if (outcome.state === "waiting") {
+      return {
+        receiptId,
+        state: "waiting",
+        balance,
+        code: "",
+        message: `The prompt is still on the customer's phone.${reason ? ` ${reason}` : ""} Nothing is received until they enter their PIN.`,
+      };
+    }
+    return {
+      receiptId,
+      state: "not_paid",
+      balance,
+      code: "",
+      message: `No M-Pesa money has arrived for this sale.${reason ? ` ${reason}` : ""} Keep the goods until they pay. Take cash and use Record payment, check the phone number, or send the prompt again.`,
+    };
+  }
+
+  async function checkPayment(receiptId) {
+    setCheckingPay(true);
+    try {
+      const outcome = await receiptsApi.checkPayment(receiptId);
+      // A watch on an older receipt must not overwrite the till's current verdict.
+      setPayStatus((current) =>
+        !current || current.receiptId === receiptId ? describePayment(receiptId, outcome) : current,
+      );
+      updateReceipt(outcome.receipt);
+      return outcome.state;
+    } catch (error) {
+      setPayStatus((current) => ({
+        receiptId,
+        state: "unknown",
+        code: "",
+        balance: current?.receiptId === receiptId ? Number(current.balance || 0) : 0,
+        message: `${apiErrorMessage(
+          error,
+          "Could not reach Safaricom for a status check.",
+        )} The payment may still come through - check again in a moment.`,
+      }));
+      return null;
+    } finally {
+      setCheckingPay(false);
+    }
+  }
+
+  function stopPayWatch() {
+    if (payTimerRef.current) window.clearTimeout(payTimerRef.current);
+    payTimerRef.current = 0;
+  }
+
+  // The M-Pesa callback is not guaranteed to reach a local server, so the till
+  // asks Safaricom itself until the prompt turns paid or fails.
+  function watchPayment(receiptId, attempt = 0) {
+    stopPayWatch();
+    payTimerRef.current = window.setTimeout(async () => {
+      const state = await checkPayment(receiptId);
+      if (state && state !== "waiting") return;
+      if (attempt >= 5) {
+        payTimerRef.current = 0;
+        setPayStatus((current) =>
+          current?.receiptId === receiptId && current.state === "waiting"
+            ? {
+                ...current,
+                message:
+                  "Still waiting for the customer to enter their PIN. This message keeps its place until the money arrives or Safaricom cancels the prompt. Press Check payment now to ask again.",
+              }
+            : current,
         );
-        if (lastReceipt?.id === receipt.id) setLastReceipt(receipt);
-        const latest = receipt.payments.at(-1);
-        if (latest?.status === "pending") {
-          pollStk(receiptId, attempt + 1);
-        } else if (latest?.status === "succeeded") {
-          setStkStatus({
-            type: "success",
-            message: `M-Pesa confirmed. Reference ${latest.reference || "received"}.`,
-          });
-        } else if (latest?.status === "failed") {
-          setStkStatus({
-            type: "error",
-            message: latest.result_description || "M-Pesa payment was not completed.",
-          });
-        }
-      } catch {
-        if (attempt < 11) pollStk(receiptId, attempt + 1);
+        return;
       }
+      watchPayment(receiptId, attempt + 1);
     }, 5000);
   }
 
@@ -541,6 +633,21 @@ export default function SalesScreen() {
       list.map((entry) => (entry.id === updated.id ? updated : entry)),
     );
     if (lastReceipt?.id === updated.id) setLastReceipt(updated);
+    // A message that contradicts the receipt is what confuses the counter, so any
+    // payment recorded another way settles the M-Pesa verdict as well.
+    setPayStatus((current) => {
+      if (current?.receiptId !== updated.id || Number(updated.balance) > 0) return current;
+      stopPayWatch();
+      const last = updated.payments?.at(-1);
+      const label = SETTLED_LABELS[last?.method] || "Payment";
+      return {
+        receiptId: updated.id,
+        state: "paid",
+        balance: 0,
+        code: last?.reference || "",
+        message: `${label} of KES ${money(last?.amount ?? updated.amount_paid)} received. This sale is fully paid - hand over the goods.`,
+      };
+    });
   }
 
   return (
@@ -663,7 +770,9 @@ export default function SalesScreen() {
               onPrint={printReceiptDocument}
               onStk={(receipt) => askStk(receipt, Number(receipt.balance))}
               onSettle={setSettleTarget}
-              stkStatus={stkTarget?.receipt.id === lastReceipt.id ? stkStatus : null}
+              payment={payStatus?.receiptId === lastReceipt.id ? payStatus : null}
+              checkingPayment={checkingPay}
+              onCheckPayment={() => checkPayment(lastReceipt.id)}
             />
           )}
         </div>
@@ -680,13 +789,12 @@ export default function SalesScreen() {
         target={stkTarget}
         phone={stkPhone}
         onPhoneChange={setStkPhone}
-        status={stkStatus}
+        status={stkTarget && payStatus?.receiptId === stkTarget.receipt.id ? payStatus : null}
         saving={sendingStk}
+        checking={checkingPay}
+        onCheck={() => stkTarget && checkPayment(stkTarget.receipt.id)}
         onSend={sendStk}
-        onClose={() => {
-          setStkTarget(null);
-          setStkStatus(null);
-        }}
+        onClose={() => setStkTarget(null)}
       />
 
       <SettlePaymentModal

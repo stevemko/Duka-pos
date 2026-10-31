@@ -225,3 +225,112 @@ class ProductCatalogTests(TestCase):
 		response = client.post(reverse("product-import"), {"file": upload}, format="multipart")
 
 		self.assertEqual(response.status_code, 403)
+
+
+class ProductMergeTests(TestCase):
+	def setUp(self):
+		from accounts.models import Branch
+
+		self.main = Branch.objects.get_or_create(code="MAIN", defaults={"name": "Main shop"})[0]
+		self.upstream = Branch.objects.create(code="UPSTREAM", name="Upstream shop")
+		self.super_user = get_user_model().objects.create_user(
+			username="boss", password="test-password", is_staff=True, is_superuser=True
+		)
+		self.manager = get_user_model().objects.create_user(
+			username="manager", password="test-password", is_staff=True
+		)
+		self.client = APIClient()
+		self.client.force_authenticate(self.super_user)
+		self.kept = Product.objects.create(
+			branch=self.main, name="Side mirror", sku="SM-001",
+			cost_price="300.00", selling_price="450.00", stock_quantity=5,
+		)
+		self.duplicate = Product.objects.create(
+			branch=self.main, name="Sidemirror", sku="SM-002",
+			cost_price="310.00", selling_price="500.00", stock_quantity=12,
+		)
+
+	def test_merge_moves_stock_and_history_into_the_kept_product(self):
+		from alerts.models import StockAlert
+		from sales.models import Sale, SaleReceipt
+
+		receipt = SaleReceipt.objects.create(branch=self.main)
+		sale = Sale.objects.create(
+			receipt=receipt, product=self.duplicate, quantity=2,
+			price_sold_at=Decimal("500.00"),
+		)
+		StockAlert.objects.create(product=self.duplicate, stock_at_trigger=1)
+
+		response = self.client.post(
+			reverse("product-merge", args=[self.duplicate.pk]),
+			{"target": str(self.kept.pk)},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["stock_moved"], 12)
+		self.assertEqual(response.data["sales_moved"], 1)
+		self.assertFalse(Product.objects.filter(pk=self.duplicate.pk).exists())
+
+		kept = Product.objects.get(pk=self.kept.pk)
+		self.assertEqual(kept.stock_quantity, 17)
+		sale.refresh_from_db()
+		self.assertEqual(sale.product_id, kept.pk)
+		self.assertEqual(sale.price_sold_at, Decimal("500.00"))
+		self.assertEqual(kept.sales.count(), 1)
+		self.assertEqual(StockAlert.objects.count(), 0)
+
+	def test_manager_cannot_merge_products(self):
+		client = APIClient()
+		client.force_authenticate(self.manager)
+
+		response = client.post(
+			reverse("product-merge", args=[self.duplicate.pk]),
+			{"target": str(self.kept.pk)},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 403)
+		self.assertTrue(Product.objects.filter(pk=self.duplicate.pk).exists())
+
+	def test_merge_needs_a_target_in_the_same_shop(self):
+		other_shop = Product.objects.create(
+			branch=self.upstream, name="Side mirror", sku="SM-001",
+			cost_price="300.00", selling_price="450.00", stock_quantity=3,
+		)
+
+		missing = self.client.post(
+			reverse("product-merge", args=[self.duplicate.pk]), {}, format="json"
+		)
+		into_self = self.client.post(
+			reverse("product-merge", args=[self.duplicate.pk]),
+			{"target": str(self.duplicate.pk)},
+			format="json",
+		)
+		across_shops = self.client.post(
+			reverse("product-merge", args=[self.duplicate.pk]),
+			{"target": str(other_shop.pk)},
+			format="json",
+		)
+
+		self.assertEqual(missing.status_code, 400)
+		self.assertEqual(into_self.status_code, 400)
+		self.assertEqual(across_shops.status_code, 400)
+		self.assertIn("same shop", str(across_shops.data["target"]))
+		self.assertEqual(Product.objects.count(), 3)
+
+	def test_legacy_product_can_merge_into_the_main_shop_row(self):
+		# Old rows were saved with no branch, which the list still labels "Main shop".
+		legacy = Product.objects.create(
+			name="side mirror", sku="SM-003",
+			cost_price="300.00", selling_price="450.00", stock_quantity=4,
+		)
+
+		response = self.client.post(
+			reverse("product-merge", args=[legacy.pk]),
+			{"target": str(self.kept.pk)},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(Product.objects.get(pk=self.kept.pk).stock_quantity, 9)

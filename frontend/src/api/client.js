@@ -195,6 +195,10 @@ export const productsApi = {
   },
 
   remove: (id) => client.delete(`/products/${id}/`),
+
+  // Super admin only: fold a product entered twice into the one you keep.
+  merge: (id, targetId) =>
+    client.post(`/products/${id}/merge/`, { target: targetId }).then((res) => res.data),
 };
 
 export const salesApi = {
@@ -242,6 +246,11 @@ export const receiptsApi = {
 
   stkPush: (id, data) =>
     client.post(`/receipts/${id}/stk-push/`, data).then((res) => res.data),
+
+  // Ask Safaricom directly what happened to an open prompt, so the till can say
+  // whether the money is in rather than guessing from a silent callback.
+  checkPayment: (id) =>
+    client.post(`/receipts/${id}/check-payment/`, {}).then((res) => res.data),
 
   exportCsv: (params) =>
     client

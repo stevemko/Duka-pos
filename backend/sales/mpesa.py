@@ -9,6 +9,8 @@ from decouple import config
 from django.core.cache import cache
 from django.utils import timezone
 
+from sales.models import Payment
+
 logger = logging.getLogger(__name__)
 
 PLACEHOLDER_VALUES = {"", "generate-a-long-random-value"}
@@ -54,8 +56,8 @@ def _post_json(url, payload, headers):
             pass
         logger.warning("Daraja HTTP %s: %s", error.code, detail)
         raise MpesaError(
-            f"Safaricom rejected the request (HTTP {error.code}). "
-            "Check the Daraja setup and try again."
+            f"Safaricom did not answer (HTTP {error.code}). "
+            "Nothing is confirmed by this response - try again in a minute."
         ) from error
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
         logger.warning("Daraja request failed: %s", error)
@@ -173,3 +175,40 @@ def query_stk_push(payment):
         payload,
         {"Authorization": f"Bearer {access_token}"},
     )
+
+
+# Result codes meaning the customer never finished the prompt, so the seller can
+# safely send it again.
+FAILED_QUERY_CODES = {"1032", "1037", "9999"}
+
+
+def apply_query_result(payment, response):
+    """Turn a Daraja status query into the outcome for this payment.
+
+    Returns ``(status, description, mpesa_code)`` where status is None while
+    Daraja has not settled the prompt yet.
+    """
+    result_code = str(response.get("ResultCode", response.get("ResponseCode", "")))
+    description = str(
+        response.get("ResultDesc") or response.get("ResponseDescription") or ""
+    )[:255]
+
+    if result_code == "0":
+        metadata_items = (response.get("CallbackMetadata") or {}).get("Item") or []
+        metadata = {
+            item.get("Name"): item.get("Value")
+            for item in metadata_items
+            if isinstance(item, dict) and item.get("Name")
+        }
+        return (
+            Payment.Status.SUCCEEDED,
+            description or "Confirmed by Daraja status query.",
+            str(metadata.get("MpesaReceiptNumber", ""))[:100],
+        )
+    if result_code in FAILED_QUERY_CODES:
+        return (
+            Payment.Status.FAILED,
+            description or "Customer did not complete the M-Pesa prompt.",
+            "",
+        )
+    return (None, description, "")

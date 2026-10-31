@@ -47,6 +47,7 @@ const paths = {
   bank: "M3 10h18M5 10v8M9 10v8M15 10v8M19 10v8M2 21h20M12 2 2 7h20Z",
   tag: "M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82ZM7 7h.01",
   scan: "M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 12h10",
+  merge: "M7 4v6l5 4 5-4V4M12 14v6M9 17l3 3 3-3",
 };
 
 export default function Icon({ name, size = 20, strokeWidth = 1.8, className = "" }) {

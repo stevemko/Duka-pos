@@ -49,7 +49,7 @@ function mainBranchId(branches) {
 }
 
 export default function InventoryScreen() {
-  const { canManage, branches, branchQuery, canViewAllBranches } = useAuth();
+  const { canManage, canManageUsers, branches, branchQuery, canViewAllBranches } = useAuth();
   const [catalog, setCatalog] = useState({ results: [], count: 0, next: null });
   const [categories, setCategories] = useState([]);
   const [overview, setOverview] = useState(null);
@@ -64,6 +64,7 @@ export default function InventoryScreen() {
   const [editing, setEditing] = useState(null);
   const [formOpen, setFormOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [merging, setMerging] = useState(null);
   const requestId = useRef(0);
 
   const branchParams = useMemo(
@@ -148,12 +149,16 @@ export default function InventoryScreen() {
       setStatus({ type: "success", message: `${product.name} deleted.` });
       reload();
     } catch (error) {
+      const message = apiErrorMessage(
+        error,
+        "Could not delete the product. It may have recorded sales.",
+      );
       setStatus({
         type: "error",
-        message: apiErrorMessage(
-          error,
-          "Could not delete the product. It may have recorded sales.",
-        ),
+        message:
+          error?.response?.status === 409 && canManageUsers
+            ? `${message} To remove a duplicate, use Merge.`
+            : message,
       });
     }
   }
@@ -395,6 +400,13 @@ export default function InventoryScreen() {
                               label={`Edit ${product.name}`}
                               onClick={() => openEdit(product)}
                             />
+                            {canManageUsers && (
+                              <IconButton
+                                icon="merge"
+                                label={`Merge ${product.name} into another product`}
+                                onClick={() => setMerging(product)}
+                              />
+                            )}
                             <IconButton
                               icon="trash"
                               label={`Delete ${product.name}`}
@@ -451,6 +463,21 @@ export default function InventoryScreen() {
         canChooseBranch={canViewAllBranches}
         onClose={() => setImportOpen(false)}
         onImported={reload}
+      />
+
+      <MergeProductsModal
+        open={Boolean(merging)}
+        product={merging}
+        canViewAllBranches={canViewAllBranches}
+        onClose={() => setMerging(null)}
+        onMerged={(outcome) => {
+          setMerging(null);
+          setStatus({
+            type: "success",
+            message: `Merged ${outcome.merged_name} into ${outcome.into.name}. ${outcome.stock_moved} units and ${outcome.sales_moved} recorded sales moved; the duplicate is gone.`,
+          });
+          reload();
+        }}
       />
     </div>
   );
@@ -808,6 +835,168 @@ function ImportProductsModal({ open, branches, defaultBranch, canChooseBranch, o
             </p>
           </div>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+function MergeProductsModal({ open, product, canViewAllBranches, onClose, onMerged }) {
+  const [choices, setChoices] = useState([]);
+  const [query, setQuery] = useState("");
+  const [targetId, setTargetId] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const searchId = useRef(0);
+
+  useEffect(() => {
+    if (!open) return;
+    setQuery("");
+    setTargetId("");
+    setError("");
+    setChoices([]);
+  }, [open, product?.id]);
+
+  // Search the whole branch rather than only the page currently on screen, so a
+  // duplicate can be merged into a product found further down the list.
+  useEffect(() => {
+    if (!open) return;
+    const id = searchId.current + 1;
+    searchId.current = id;
+    const timer = window.setTimeout(() => {
+      setSearching(true);
+      productsApi
+        .list({
+          q: query.trim() || undefined,
+          branch: product?.branch || undefined,
+          page_size: 40,
+        })
+        .then((data) => {
+          if (searchId.current !== id) return;
+          setChoices(data.results.filter((item) => item.id !== product?.id));
+        })
+        .catch(() => {
+          if (searchId.current === id) setChoices([]);
+        })
+        .finally(() => {
+          if (searchId.current === id) setSearching(false);
+        });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [open, query, product]);
+
+  const target = choices.find((item) => item.id === targetId) || null;
+  const pricesDiffer =
+    target &&
+    (String(target.selling_price) !== String(product?.selling_price) ||
+      String(target.cost_price) !== String(product?.cost_price));
+
+  async function submit() {
+    if (!target) {
+      setError("Choose the product you want to keep.");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      onMerged(await productsApi.merge(product.id, target.id));
+    } catch (requestError) {
+      setError(apiErrorMessage(requestError, "Could not merge these products."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Merge duplicate product"
+      subtitle="Use this when the same item was entered twice under different names. The stock and sales history move into the product you keep."
+      size="lg"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="brand" icon="merge" loading={busy} onClick={submit}>
+            Merge and remove the duplicate
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div className="rounded-xl border border-red-200 bg-red-50/70 px-4 py-3">
+          <p className="text-[10px] font-bold uppercase tracking-wide text-red-700">Remove this entry</p>
+          <p className="mt-0.5 font-semibold text-ink-900">{product?.name}</p>
+          <p className="text-xs text-ink-500">
+            {product?.sku ? `${product.sku} · ` : ""}
+            {product?.stock_quantity ?? 0} units · wholesale {money(product?.cost_price ?? 0)} ·
+            retail {money(product?.selling_price ?? 0)}
+          </p>
+        </div>
+
+        <Field
+          label="Keep this product"
+          required
+          hint="Every sale and unit from the duplicate is moved onto this one."
+        >
+          <SearchInput
+            value={query}
+            onChange={setQuery}
+            placeholder="Search the product to keep..."
+            className="mb-2"
+          />
+          <Select
+            value={targetId}
+            onChange={(event) => setTargetId(event.target.value)}
+            disabled={searching && choices.length === 0}
+          >
+            <option value="">
+              {searching ? "Searching..." : `${choices.length ? "Choose a product" : "No products found"}`}
+            </option>
+            {choices.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+                {item.sku ? ` · ${item.sku}` : ""} · {item.stock_quantity} units
+                {canViewAllBranches ? ` · ${item.branch_name}` : ""}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        {target && (
+          <div className="rounded-xl border border-ink-200 bg-ink-50 px-4 py-3">
+            <p className="text-[10px] font-bold uppercase tracking-wide text-ink-500">
+              Product you keep
+            </p>
+            <p className="mt-0.5 font-semibold text-ink-900">{target.name}</p>
+            <p className="text-xs text-ink-500">
+              {target.sku ? `${target.sku} · ` : ""}
+              {target.stock_quantity} units · wholesale {money(target.cost_price ?? 0)} · retail{" "}
+              {money(target.selling_price)}
+            </p>
+            <p className="mt-2 text-sm font-semibold text-brand-900">
+              Stock after the merge:{" "}
+              {Number(product?.stock_quantity ?? 0) + Number(target.stock_quantity ?? 0)} units
+            </p>
+            {pricesDiffer && (
+              <p className="mt-2 flex items-start gap-2 text-xs text-amber-800">
+                <Icon name="alert" size={14} className="mt-0.5 shrink-0" />
+                The two entries have different prices. The kept product keeps its own prices, so
+                check them if you want the merged stock sold differently.
+              </p>
+            )}
+          </div>
+        )}
+
+        <p className="flex items-start gap-2 text-xs text-ink-500">
+          <Icon name="receipt" size={14} className="mt-0.5 shrink-0" />
+          Receipts are not rewritten or lost. Old sales simply show under the product you keep, so
+          your totals stay the same.
+        </p>
+
+        {error && <Alert tone="error">{error}</Alert>}
       </div>
     </Modal>
   );

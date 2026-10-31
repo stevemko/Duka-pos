@@ -5,7 +5,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from sales.models import Payment
-from sales.mpesa import MpesaError, query_stk_push
+from sales.mpesa import MpesaError, apply_query_result, query_stk_push
 
 
 class Command(BaseCommand):
@@ -47,7 +47,7 @@ class Command(BaseCommand):
             if not payment.checkout_request_id:
                 self._mark(
                     payment, Payment.Status.FAILED,
-                    "Timed out before Safaricom returned a checkout request ID.",
+                    "Timed out before Safaricom returned a checkout request ID.", "",
                     dry_run,
                 )
                 failed += 1
@@ -60,31 +60,19 @@ class Command(BaseCommand):
                 errored += 1
                 continue
 
-            result_code = str(response.get("ResultCode", response.get("ResponseCode", "")))
-            description = str(
-                response.get("ResultDesc") or response.get("ResponseDescription") or ""
-            )[:255]
-
-            if result_code == "0":
-                self._mark(
-                    payment, Payment.Status.SUCCEEDED,
-                    description or "Confirmed by Daraja status query.",
-                    dry_run,
-                )
-                succeeded += 1
-            elif result_code in {"1032", "1037", "9999"}:
-                # Customer never responded / prompt timed out: safe to fail and retry.
-                self._mark(
-                    payment, Payment.Status.FAILED,
-                    description or "Customer did not complete the M-Pesa prompt.",
-                    dry_run,
-                )
-                failed += 1
-            else:
+            new_status, description, reference = apply_query_result(payment, response)
+            if new_status is None:
                 self.stdout.write(
-                    f"{payment.id}: still pending (Daraja code {result_code or 'unknown'})."
+                    f"{payment.id}: still pending ({description or 'no description from Daraja'})."
                 )
                 still_pending += 1
+                continue
+
+            self._mark(payment, new_status, description, reference, dry_run)
+            if new_status == Payment.Status.SUCCEEDED:
+                succeeded += 1
+            else:
+                failed += 1
 
         prefix = "Would mark" if dry_run else "Marked"
         self.stdout.write(self.style.SUCCESS(
@@ -93,9 +81,15 @@ class Command(BaseCommand):
         ))
 
     @staticmethod
-    def _mark(payment, status, description, dry_run):
+    def _mark(payment, status, description, reference, dry_run):
         if dry_run:
             return
         payment.status = status
         payment.result_description = description
-        payment.save(update_fields=["status", "result_description"])
+        # The prompt may already carry the code from a partial callback; never
+        # overwrite a recorded M-Pesa receipt code with a blank.
+        fields = ["status", "result_description"]
+        if reference:
+            payment.reference = reference
+            fields.append("reference")
+        payment.save(update_fields=fields)
