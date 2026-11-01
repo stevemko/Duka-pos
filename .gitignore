@@ -28,6 +28,13 @@ Thumbs.db
 # Logs
 *.log
 
+# Runtime state on the shop machine
+backend/logs/
+backend/backups/
+# WAL side files: they belong to the database, never to the repository.
+*-wal
+*-shm
+
 # Local virtualenv, archives and staging copies (never version these)
 *_venv/
 *.zip

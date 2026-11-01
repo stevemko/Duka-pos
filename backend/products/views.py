@@ -24,6 +24,7 @@ from accounts.services import (
 from .models import Product
 from .permissions import IsStaffOrReadOnly
 from .serializers import ProductSerializer
+from .services import move_stock
 
 ORDERING_FIELDS = {
     "name", "-name",
@@ -165,8 +166,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             sales_moved = source.sales.update(product=target)
             stock_moved = source.stock_quantity
             if stock_moved:
-                target.stock_quantity += stock_moved
-                target.save(update_fields=["stock_quantity", "updated_at"])
+                move_stock(target, stock_moved)
             # Restock alerts for the duplicate are dropped with it; the next sale
             # re-triggers one against the product that was kept.
             source.delete()
@@ -329,7 +329,12 @@ class ProductViewSet(viewsets.ModelViewSet):
             ))
 
         if to_create:
-            Product.objects.bulk_create(to_create, batch_size=200)
+            # bulk_create sends the rows in batches, so a database hiccup halfway
+            # through would leave the shop with part of its price list loaded. The
+            # retry would then reject every SKU it already wrote. All of the file,
+            # or none of it.
+            with transaction.atomic():
+                Product.objects.bulk_create(to_create, batch_size=200)
 
         return Response({
             "created": len(to_create),

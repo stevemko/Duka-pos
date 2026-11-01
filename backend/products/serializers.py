@@ -5,6 +5,7 @@ from accounts.models import Branch
 from accounts.services import resolve_branch
 
 from .models import Product
+from .services import move_stock
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -17,6 +18,10 @@ class ProductSerializer(serializers.ModelSerializer):
     price_floor = serializers.DecimalField(
         source="cost_price", max_digits=10, decimal_places=2, read_only=True
     )
+    # The stock number the edit form was opened with. Without it, saving a new
+    # price would write back the count the manager read minutes ago and erase any
+    # sale that completed while the form was open.
+    stock_quantity_from = serializers.IntegerField(write_only=True, required=False, min_value=0)
 
     def _target_branch(self, data):
         if "branch" in data:
@@ -51,8 +56,31 @@ class ProductSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
+        validated_data.pop("stock_quantity_from", None)
         validated_data.setdefault("selling_price", validated_data["cost_price"])
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        counted_from = validated_data.pop("stock_quantity_from", None)
+        if counted_from is None:
+            return super().update(instance, validated_data)
+
+        counted = validated_data.pop("stock_quantity", None)
+        product = super().update(instance, validated_data)
+        if counted is None or counted == counted_from:
+            # A price-only edit never touches the shelf, so whatever the tills sold
+            # while the form was open stays counted.
+            return product
+
+        moved = move_stock(product, counted - counted_from)
+        if moved is None:
+            raise serializers.ValidationError({
+                "stock_quantity": (
+                    "The stock on the system fell below this count while you were editing. "
+                    "Reload the product and enter the counted number again."
+                )
+            })
+        return moved
 
     def validate_image(self, image):
         allowed_extensions = {".jpg", ".jpeg", ".png", ".webp"}
@@ -83,7 +111,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             "id", "branch", "branch_name", "name", "sku", "category", "image",
             "cost_price", "selling_price", "price_floor", "stock_quantity",
-            "reorder_threshold", "needs_restock", "created_at", "updated_at",
+            "stock_quantity_from", "reorder_threshold", "needs_restock", "created_at", "updated_at",
         ]
 
     def to_representation(self, instance):

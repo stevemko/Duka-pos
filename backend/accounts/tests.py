@@ -1,8 +1,17 @@
+import io
+import sqlite3
+import tempfile
+from contextlib import closing
+from pathlib import Path
+
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core.management import call_command
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
+
+from products.models import Product
 
 from .models import Branch, StaffProfile
 
@@ -179,3 +188,81 @@ class BranchTests(TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertTrue(Branch.objects.filter(pk=branch.pk).exists())
+
+
+class BackupShopCommandTests(TransactionTestCase):
+    """A copy of the books that cannot be reopened is not a copy.
+
+    These run outside a wrapping transaction because SQLite will not take a
+    backup snapshot through a connection that is itself mid-write, which is also
+    how the command runs in the shop: a separate process, in autocommit.
+    """
+
+    def setUp(self):
+        Product.objects.create(
+            name="Backup bulb", sku="BACKUP-1",
+            cost_price="180.00", selling_price="250.00", stock_quantity=4,
+        )
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.destination = Path(folder.name)
+        self.output = io.StringIO()
+
+    def back_up(self, *extra):
+        call_command(
+            "backup_shop",
+            "--destination",
+            str(self.destination),
+            "--without-media",
+            *extra,
+            stdout=self.output,
+        )
+        return sorted(path.name for path in self.destination.glob("shop-*.sqlite3"))
+
+    def test_writes_a_copy_that_opens_and_holds_the_records(self):
+        copies = self.back_up()
+
+        self.assertEqual(len(copies), 1)
+        with closing(sqlite3.connect(self.destination / copies[0])) as connection:
+            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM products_product WHERE sku='BACKUP-1'"
+                ).fetchone()[0],
+                1,
+            )
+        self.assertIn("opens cleanly", self.output.getvalue())
+
+    def test_dry_run_writes_nothing(self):
+        copies = self.back_up("--dry-run")
+
+        self.assertEqual(copies, [])
+
+    def test_only_the_newest_copies_are_kept(self):
+        for name in (
+            "shop-2026-01-01-000000.sqlite3",
+            "shop-2026-01-02-000000.sqlite3",
+            "shop-2026-01-03-000000.sqlite3",
+        ):
+            (self.destination / name).write_bytes(b"old")
+
+        copies = self.back_up("--keep", "2")
+
+        self.assertEqual(len(copies), 2)
+        self.assertIn("shop-2026-01-03-000000.sqlite3", copies)
+        self.assertNotIn("shop-2026-01-01-000000.sqlite3", copies)
+        self.assertNotIn("shop-2026-01-02-000000.sqlite3", copies)
+
+    def test_product_photos_travel_with_the_books(self):
+        media = self.destination / "media-root"
+        (media / "products").mkdir(parents=True)
+        (media / "products" / "bulb.jpg").write_bytes(b"photo")
+        (media / "products" / "spot.jpg").write_bytes(b"photo")
+
+        with override_settings(MEDIA_ROOT=str(media)):
+            call_command(
+                "backup_shop", "--destination", str(self.destination), stdout=self.output
+            )
+
+        self.assertTrue((self.destination / "media" / "products" / "bulb.jpg").exists())
+        self.assertIn("2 photo file(s) copied", self.output.getvalue())

@@ -206,6 +206,21 @@ missing or wrong token.
 - [ ] Staff know that STK requests are whole shillings; cents stay on the
       balance and can be settled in cash.
 
+The same day, on the shop machine:
+
+- [ ] `SECRET_KEY` and `MPESA_CALLBACK_TOKEN` are freshly generated values, not
+      the ones used while setting this up.
+- [ ] `DEBUG=False`, and `manage.py check --deploy` is read through.
+- [ ] The database is not inside a synced folder (`manage.py check` shows no
+      `config.W001`).
+- [ ] `backup_shop` is scheduled, has written at least one copy to a second disk,
+      and that copy has been opened as a restore test.
+- [ ] `deliver_alerts` is scheduled if the shop uses WhatsApp restock messages.
+- [ ] Every till was opened once from the shop's own address, installed as an app,
+      and one sale was completed on each.
+- [ ] Each cashier has their own login; no shared password, and the wholesale cost
+      is hidden from them.
+
 Secrets were pasted in chat during setup: rotate the consumer key/secret and
 passkey in Daraja before go-live, then update `.env`.
 
@@ -310,27 +325,43 @@ set the same environment variables. The callback URL must be stable HTTPS.
 
 ### Backups and durability
 
-- Use **PostgreSQL** from day one in production. SQLite is fine for one till
-  during development but not for years of multi-branch data.
-- Nightly `pg_dump` to a second disk and an offsite bucket, keep at least 30
-  daily + 12 monthly copies, and **test a restore quarterly**:
+The shop trades from one machine with one database file, so the copy is the plan.
 
-```bash
-pg_dump "$DATABASE_URL" -Fc -f duka-$(date +%F).dump
-pg_restore --clean --no-owner -d "$TARGET_DATABASE_URL" duka-2026-10-30.dump
+1. **Keep the file outside any synced folder.** A OneDrive or Dropbox copy taken
+   while the server is writing gives a database that will not open, and a second
+   till pointed at the same file through a sync loses sales. `manage.py check`
+   warns (`config.W001`) when it spots one. To move it: stop the server, set
+   `DATABASE_PATH=C:\ShopData\greenlight.sqlite3` in `backend/.env`, copy
+   `db.sqlite3` there, then start again and sign in.
+2. **Copy the books every night** with a scheduled job:
+
+```bat
+backend_venv\Scripts\python.exe manage.py backup_shop --destination D:\ShopBackups
 ```
 
-- Back up `backend/media/` (product images) alongside the database.
-- Configure Postgres WAL/point-in-time recovery if you can; it protects the
-  last few minutes, not just the last night.
+   `backup_shop` writes a consistent copy through SQLite's own backup API (a plain
+   file copy can catch a page half-written or leave its WAL behind), copies the
+   product photos, opens the copy again to prove it reads, and keeps the newest 30
+   copies. Put the destination on a second disk and carry a copy off the machine
+   weekly; `--dry-run` and `--keep` are there for when you want to look first.
+3. **Test a restore twice a year**: stop the server, set `DATABASE_PATH` to one of
+   the copies, start, and check the receipts and the ledger are there. Then put
+   `DATABASE_PATH` back to the live file.
+
+The database runs in write-ahead logging mode, so a sale being written does not
+freeze the product search on another till; `db.sqlite3-wal` is part of the database
+and must never be deleted on its own.
+
 - Keep receipts append-only: the app never updates or deletes recorded sales
   or payments, prices are copied at sale time, and products/branches with
   history cannot be deleted.
-- Checkout runs in a database transaction with row locks (`select_for_update`)
-  and an idempotency key, so retries and two cashiers on the same stock cannot
-  create duplicate receipts or negative stock.
+- Checkout runs in one database transaction, every stock movement is written with
+  the availability check inside the same statement, and an idempotency key means a
+  retry after a timeout cannot create a second receipt or sell the last unit twice.
 - Indexes cover receipts by date/branch, sales by product/date, payments by
   status/date and expenses by branch/category/date. Lists are paginated.
+- A hosted PostgreSQL install (see the VPS section) is backed up with `pg_dump`
+  instead of `backup_shop`, and the same 30-copy rule applies.
 
 ### Growing to several branches
 
@@ -346,18 +377,41 @@ pg_restore --clean --no-owner -d "$TARGET_DATABASE_URL" duka-2026-10-30.dump
 6. Close a branch by setting it to **Closed**; do not delete branches that
    already have records.
 
-### Run the M-Pesa reconciler
+### Scheduled jobs the shop needs
 
-Some callbacks are lost by mobile networks. Schedule the built-in reconciler
-(cron, systemd timer, or platform scheduler) every 5 minutes:
+Three housekeeping jobs keep the shop running. None of them is on the checkout
+path, so a slow Safaricom or Twilio can never hold a cashier waiting at the counter.
 
-```bash
-cd /srv/duka-pos/backend
-.venv/bin/python manage.py reconcile_mpesa --older-than 5
+| Job | What it does | Every |
+| --- | --- | --- |
+| `reconcile_mpesa` | Asks Daraja what happened to STK prompts whose callback was lost, and settles or fails them. | 5 minutes |
+| `deliver_alerts` | Sends the restock WhatsApp messages that sales queued, and closes the ones that no longer apply (product restocked, or the alert is a day old). | 15 minutes |
+| `backup_shop` | Copies the database and the product photos to a backup folder, checks the copy opens, and prunes the oldest. | Nightly, after closing |
+
+On the shop Windows machine, register all three once from an elevated prompt:
+
+```bat
+schtasks /Create /TN "Duka POS reconcile" /SC MINUTE /MO 5 ^
+  /TR "cd /d C:\duka-pos\backend && backend_venv\Scripts\python.exe manage.py reconcile_mpesa --older-than 5 >> logs\reconcile.log 2>&1"
+schtasks /Create /TN "Duka POS alerts" /SC MINUTE /MO 15 ^
+  /TR "cd /d C:\duka-pos\backend && backend_venv\Scripts\python.exe manage.py deliver_alerts >> logs\alerts.log 2>&1"
+schtasks /Create /TN "Duka POS backup" /SC DAILY /ST 21:30 ^
+  /TR "cd /d C:\duka-pos\backend && backend_venv\Scripts\python.exe manage.py backup_shop --destination D:\ShopBackups >> logs\backup.log 2>&1"
 ```
 
-It asks Daraja for the status of stale pending prompts and settles or fails
-them. `--dry-run` prints what it would change.
+Use the folder you actually copied the project to. On a Linux host the same three
+lines go in cron:
+
+```bash
+*/5  * * * * cd /srv/duka-pos/backend && .venv/bin/python manage.py reconcile_mpesa --older-than 5
+*/15 * * * * cd /srv/duka-pos/backend && .venv/bin/python manage.py deliver_alerts
+30 21 * * *  cd /srv/duka-pos/backend && .venv/bin/python manage.py backup_shop --destination /srv/backups
+```
+
+All three accept `--dry-run` to print what they would change without touching
+anything. A sale recorded while M-Pesa or Twilio is unreachable is never lost:
+the receipt and the alert row are already committed, and the next run picks
+them up.
 
 ## Tests and checks
 

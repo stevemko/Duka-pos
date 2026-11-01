@@ -5,6 +5,7 @@ from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 from .models import Product
+from .services import move_stock
 
 
 class ProductCostEntryTests(TestCase):
@@ -334,3 +335,101 @@ class ProductMergeTests(TestCase):
 
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(Product.objects.get(pk=self.kept.pk).stock_quantity, 9)
+
+
+class StockMovementTests(TestCase):
+	"""Stock only ever moves by a number of units, checked in the write itself.
+
+	An absolute overwrite - the shape a stale edit form produces - undoes whatever
+	the tills sold while it was open."""
+
+	def setUp(self):
+		self.manager = get_user_model().objects.create_user(
+			username="stock-manager", password="test-password", is_staff=True
+		)
+		self.client = APIClient()
+		self.client.force_authenticate(self.manager)
+		self.bulb = Product.objects.create(
+			name="LED bulb 9W", sku="STOCK-9W",
+			cost_price="180.00", selling_price="250.00", stock_quantity=10, reorder_threshold=2,
+		)
+
+	def sell_behind_the_form(self, units):
+		"""Stand in for another till: change the shelf without touching this object."""
+		Product.objects.filter(pk=self.bulb.pk).update(stock_quantity=10 - units)
+
+	def test_movement_cannot_take_more_than_the_shelf_holds(self):
+		self.bulb.refresh_from_db()
+
+		self.assertIsNone(move_stock(self.bulb, -11))
+		self.assertEqual(Product.objects.get(pk=self.bulb.pk).stock_quantity, 10)
+
+	def test_movement_adds_to_what_the_shelf_holds_now(self):
+		self.sell_behind_the_form(4)
+
+		moved = move_stock(self.bulb, 3)
+
+		self.assertIsNotNone(moved)
+		self.assertEqual(Product.objects.get(pk=self.bulb.pk).stock_quantity, 9)
+
+	def test_editing_prices_leaves_sold_stock_alone(self):
+		self.sell_behind_the_form(3)
+
+		response = self.client.patch(
+			reverse("product-detail", args=[self.bulb.pk]),
+			{
+				"selling_price": "260.00",
+				"stock_quantity": 10,
+				"stock_quantity_from": 10,
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		shelf = Product.objects.get(pk=self.bulb.pk)
+		self.assertEqual(shelf.stock_quantity, 7)
+		self.assertEqual(shelf.selling_price, Decimal("260.00"))
+
+	def test_a_counted_number_moves_stock_by_the_difference(self):
+		# The shelf was counted at 12 while the system said 10, and a till sold 3
+		# of those 10 before the manager pressed save.
+		self.sell_behind_the_form(3)
+
+		response = self.client.patch(
+			reverse("product-detail", args=[self.bulb.pk]),
+			{"stock_quantity": 12, "stock_quantity_from": 10},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(Product.objects.get(pk=self.bulb.pk).stock_quantity, 9)
+
+	def test_a_count_the_shelf_cannot_surrender_is_refused(self):
+		self.sell_behind_the_form(9)
+
+		response = self.client.patch(
+			reverse("product-detail", args=[self.bulb.pk]),
+			{"stock_quantity": 0, "stock_quantity_from": 10},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("Reload the product", str(response.data["stock_quantity"]))
+		self.assertEqual(Product.objects.get(pk=self.bulb.pk).stock_quantity, 1)
+
+	def test_a_sale_takes_stock_from_what_the_shelf_holds(self):
+		# The units come off the current number, not the one this request read, so
+		# a movement that happened in between is not lost.
+		self.sell_behind_the_form(2)
+
+		response = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"items": [{"product": str(self.bulb.pk), "quantity": 3, "price_sold_at": "250.00"}],
+			},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 201, response.data)
+		self.assertEqual(Product.objects.get(pk=self.bulb.pk).stock_quantity, 5)

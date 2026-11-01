@@ -156,6 +156,11 @@ WSGI_APPLICATION = 'config.wsgi.application'
 
 DATABASE_URL = config('DATABASE_URL', default='')
 
+# The shop's books live in one file. Where that file sits is a deployment
+# decision, so it is settable rather than hard-coded: keeping it inside a synced
+# folder (OneDrive, Dropbox) lets the sync copy a half-written database.
+DATABASE_PATH = config('DATABASE_PATH', default=str(BASE_DIR / 'db.sqlite3'))
+
 if DATABASE_URL:
     import dj_database_url
     DATABASES = {
@@ -167,13 +172,22 @@ if DATABASE_URL:
     if DATABASES['default']['ENGINE'].endswith('sqlite3'):
         DATABASES['default'].setdefault('OPTIONS', {})['timeout'] = 20
 else:
+    _database_path = Path(DATABASE_PATH)
+    # A shop machine is often told to keep the books on another drive, and the
+    # folder is the part that gets forgotten.
+    _database_path.parent.mkdir(parents=True, exist_ok=True)
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': BASE_DIR / 'db.sqlite3',
+            'NAME': _database_path,
             'OPTIONS': {'timeout': 20},
         }
     }
+
+if DATABASES['default']['ENGINE'].endswith('sqlite3'):
+    from config.database import apply_sqlite_settings
+
+    apply_sqlite_settings()
 
 
 # Password validation
@@ -256,3 +270,32 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = 'DENY'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Logging. The shop server runs in a console window that gets closed, so the
+# record has to outlive it: a M-Pesa prompt that failed at 7pm is only findable
+# in the morning if it was written to disk.
+LOG_DIR = BASE_DIR / 'logs'
+LOG_DIR.mkdir(exist_ok=True)
+
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'shop': {'format': '{levelname} {asctime} {name} {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'shop'},
+        'file': {
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': str(LOG_DIR / 'shop.log'),
+            'maxBytes': 2_000_000,
+            'backupCount': 5,
+            'formatter': 'shop',
+            'encoding': 'utf-8',
+        },
+    },
+    'root': {
+        'handlers': ['console', 'file'],
+        'level': config('LOG_LEVEL', default='INFO'),
+    },
+}

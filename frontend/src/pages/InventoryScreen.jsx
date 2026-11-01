@@ -553,6 +553,10 @@ function ProductFormModal({ open, product, branches, canViewAllBranches, default
     if (form.branch) payload.branch = form.branch;
     try {
       if (product) {
+        // Tell the server the number this form opened with. Stock then moves by
+        // the difference the manager typed, so a sale completed while the dialog
+        // was open is not overwritten by a price edit.
+        payload.stock_quantity_from = Number(product.stock_quantity) || 0;
         await productsApi.update(product.id, payload);
         onSaved(`${payload.name} updated.`);
       } else {
