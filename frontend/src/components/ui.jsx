@@ -78,10 +78,12 @@ export function IconButton({ icon, label, variant = "ghost", className = "", ...
   );
 }
 
-export function Card({ className = "", children, ...props }) {
+export function Card({ className = "", surface = "bg-white", children, ...props }) {
   return (
     <section
-      className={cn("rounded-2xl border border-ink-200/70 bg-white shadow-card", className)}
+      // Tailwind sorts bg-white after the custom colours, so a tinted card has to
+      // replace the default surface instead of losing to it in the class list.
+      className={cn("rounded-2xl border border-ink-200/70 shadow-card", surface, className)}
       {...props}
     >
       {children}
@@ -390,8 +392,11 @@ export function StatCard({ label, value, hint, icon, tone = "neutral", emphasis 
   return (
     <div
       className={cn(
-        "rounded-2xl border bg-white p-4 shadow-card",
-        emphasis ? "border-ink-950 bg-ink-950 text-white" : "border-ink-200/70",
+        "rounded-2xl border p-4 shadow-card",
+        // One background per card: cn() only joins, so a base bg-white and an
+        // emphasised bg-ink-950 in the same list let whichever Tailwind sorts
+        // later win - the emphasised number came out white on white.
+        emphasis ? "border-ink-950 bg-ink-950 text-white" : "border-ink-200/70 bg-white",
       )}
     >
       <div className="flex items-start justify-between gap-2">

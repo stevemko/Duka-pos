@@ -25,7 +25,7 @@ export default function ReceiptSuccessCard({
   };
 
   return (
-    <Card className="animate-rise border-brand-200 bg-brand-50/50 p-4">
+    <Card surface="bg-brand-50/50" className="animate-rise border-brand-200 p-4">
       <div className="flex items-start justify-between gap-2">
         <div>
           <p className="text-sm font-semibold text-brand-900">Receipt {account}</p>
