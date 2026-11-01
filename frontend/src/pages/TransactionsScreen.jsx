@@ -51,30 +51,14 @@ function isoDate(date) {
   ).padStart(2, "0")}`;
 }
 
+// Named periods are resolved by the server from the shop's clock. Dates worked
+// out on a till whose machine is in another zone would silently move a day's
+// trade into the next report.
 function presetRange(preset, customStart, customEnd) {
-  const today = new Date();
-  switch (preset) {
-    case "today":
-      return { start_date: isoDate(today), end_date: isoDate(today) };
-    case "yesterday": {
-      const yesterday = new Date(today);
-      yesterday.setDate(today.getDate() - 1);
-      return { start_date: isoDate(yesterday), end_date: isoDate(yesterday) };
-    }
-    case "week": {
-      const weekAgo = new Date(today);
-      weekAgo.setDate(today.getDate() - 6);
-      return { start_date: isoDate(weekAgo), end_date: isoDate(today) };
-    }
-    case "month": {
-      const first = new Date(today.getFullYear(), today.getMonth(), 1);
-      return { start_date: isoDate(first), end_date: isoDate(today) };
-    }
-    case "custom":
-      return { start_date: customStart || undefined, end_date: customEnd || undefined };
-    default:
-      return {};
-  }
+  const periods = { today: "today", yesterday: "yesterday", week: "last7", month: "month" };
+  if (periods[preset]) return { period: periods[preset] };
+  if (preset === "all") return { period: "all" };
+  return { start_date: customStart || undefined, end_date: customEnd || undefined };
 }
 
 function formatDateTime(value) {

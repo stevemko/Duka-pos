@@ -6,6 +6,10 @@ const TOKEN_KEY = "duka_pos_token";
 
 const client = axios.create({
   baseURL: API_BASE_URL,
+  // A till must never sit on a spinner while the shop's network is down. After
+  // this the cashier is told the server did not answer, and a retry replays the
+  // same idempotency key instead of risking a second receipt.
+  timeout: 20000,
   headers: {
     "Content-Type": "application/json",
   },

@@ -23,6 +23,19 @@ class MpesaError(Exception):
     pass
 
 
+class MpesaUnconfirmed(MpesaError):
+    """Safaricom took the request and never answered, or answered with garbage.
+
+    The prompt may still reach the customer's phone, so a cashier must not be
+    told "nothing has been charged" in this case. Everything else - a refused
+    request, bad credentials, a number that cannot be reached - is a clean no.
+    """
+
+
+# Gateway answers that say nothing about whether the request was taken.
+AMBIGUOUS_HTTP_CODES = {408, 500, 502, 503, 504}
+
+
 def normalize_phone(phone):
     digits = re.sub(r"\D", "", phone or "")
     if digits.startswith("0") and len(digits) == 10:
@@ -55,13 +68,25 @@ def _post_json(url, payload, headers):
         except OSError:
             pass
         logger.warning("Daraja HTTP %s: %s", error.code, detail)
+        if error.code in AMBIGUOUS_HTTP_CODES:
+            raise MpesaUnconfirmed(
+                f"Safaricom did not answer (HTTP {error.code}). "
+                "Nothing is confirmed by this response - check with the customer."
+            ) from error
         raise MpesaError(
-            f"Safaricom did not answer (HTTP {error.code}). "
-            "Nothing is confirmed by this response - try again in a minute."
+            f"Safaricom refused the request (HTTP {error.code}). Nothing has been charged."
         ) from error
-    except (URLError, TimeoutError, json.JSONDecodeError) as error:
+    except (TimeoutError, json.JSONDecodeError) as error:
+        # The request left this machine; only the answer is missing.
+        logger.warning("Daraja answered late or unreadably: %s", error)
+        raise MpesaUnconfirmed(
+            "Safaricom's answer did not arrive in time. The prompt may still reach "
+            "the customer, so do not assume nothing was sent."
+        ) from error
+    except URLError as error:
+        # No connection at all: nothing ever reached Safaricom.
         logger.warning("Daraja request failed: %s", error)
-        raise MpesaError("Could not reach Safaricom. The payment request was not confirmed.") from error
+        raise MpesaError("Could not reach Safaricom. Nothing has been charged.") from error
 
 
 def _load_config():

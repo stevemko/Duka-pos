@@ -1,5 +1,7 @@
 import csv
+import hashlib
 import hmac
+import json
 import logging
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
@@ -19,7 +21,7 @@ from rest_framework.decorators import (
     permission_classes,
     throttle_classes,
 )
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 
@@ -33,14 +35,15 @@ from accounts.services import (
     user_branch,
 )
 from alerts.models import StockAlert
-from alerts.whatsapp import send_restock_whatsapp
 from config.throttles import CheckoutThrottle, PaymentThrottle, StkPushThrottle
 from expenses.models import Expense
 from products.models import Product
+from products.services import move_stock
 
 from .models import Payment, Sale, SaleReceipt, stk_pending_cutoff
 from .mpesa import (
     MpesaError,
+    MpesaUnconfirmed,
     apply_query_result,
     initiate_stk_push,
     normalize_phone,
@@ -99,14 +102,6 @@ def _assert_receipt_access(user, receipt):
 
 
 
-def _send_restock_alerts(alert_ids):
-    if not alert_ids:
-        return
-    for alert in StockAlert.objects.filter(pk__in=alert_ids).select_related("product"):
-        if send_restock_whatsapp(alert.product):
-            StockAlert.objects.filter(pk=alert.pk).update(whatsapp_sent=True)
-
-
 def _queue_restock_alert(product):
     if not product.needs_restock:
         return None
@@ -121,6 +116,58 @@ def _queue_restock_alert(product):
         stock_at_trigger=product.stock_quantity,
     )
     return alert.id
+
+
+class IdempotencyConflict(APIException):
+    """The same sale reference arrived with a different basket behind it."""
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = (
+        "That sale reference was already used for a different basket. "
+        "Check the basket, then send it again as a new sale."
+    )
+    default_code = "idempotency_conflict"
+
+
+def _request_fingerprint(payload):
+    """Digest what the till asked to sell, with the keys in a stable order."""
+    body = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _replay_or_conflict(receipt, fingerprint):
+    """Answer a repeated Idempotency-Key with the receipt it already produced.
+
+    The same key carrying a different basket is not a retry: it is a new sale sent
+    with an old reference, and quietly handing back the earlier receipt would give
+    this customer someone else's goods and someone else's total.
+    """
+    if receipt.idempotency_hash and receipt.idempotency_hash != fingerprint:
+        raise IdempotencyConflict()
+    return Response(SaleReceiptSerializer(receipt).data, status=status.HTTP_200_OK)
+
+
+def _period_range(params):
+    """Resolve a named reporting period using the server's clock, not the till's.
+
+    A laptop left on UTC would otherwise show yesterday's trade as today's: the
+    records are stamped in the shop's timezone, so only the shop's clock can say
+    which day a receipt belongs to.
+    """
+    period = (params.get("period") or "").strip()
+    if not period or period == "all":
+        return None, None
+    today = timezone.localdate()
+    if period == "today":
+        return today, today
+    if period == "yesterday":
+        day = today - timedelta(days=1)
+        return day, day
+    if period == "last7":
+        return today - timedelta(days=6), today
+    if period == "month":
+        return today.replace(day=1), today
+    raise ValidationError({"period": "Use today, yesterday, last7, month or all."})
 
 
 class SaleViewSet(viewsets.ModelViewSet):
@@ -373,6 +420,9 @@ class SaleViewSet(viewsets.ModelViewSet):
         gross_profit = totals.get("gross_profit") or Decimal("0.00")
         return Response({
             "month": month_start.strftime("%Y-%m"),
+            # The shop's clock decides which day is "today" on the dashboard: a
+            # till machine set to another zone would otherwise read the wrong row.
+            "today": timezone.localdate().isoformat(),
             "total_sales": totals["total_sales"] or Decimal("0.00"),
             "gross_profit": gross_profit if is_manager else None,
             "total_expenses": expense_total if is_manager else None,
@@ -408,10 +458,11 @@ class SaleViewSet(viewsets.ModelViewSet):
         if len(idempotency_key) > 64:
             raise ValidationError({"idempotency_key": "Use 64 characters or fewer."})
 
+        fingerprint = _request_fingerprint(request.data)
         if idempotency_key:
             existing = _receipt_queryset().filter(idempotency_key=idempotency_key).first()
             if existing:
-                return Response(SaleReceiptSerializer(existing).data, status=status.HTTP_200_OK)
+                return _replay_or_conflict(existing, fingerprint)
 
         requested_branch_id = (request.data.get("branch") or "").strip()
         if requested_branch_id:
@@ -458,8 +509,8 @@ class SaleViewSet(viewsets.ModelViewSet):
                     customer_name=(data.get("customer_name") or "").strip(),
                     customer_phone=(data.get("customer_phone") or "").strip(),
                     idempotency_key=idempotency_key or None,
+                    idempotency_hash=fingerprint if idempotency_key else "",
                 )
-                alert_ids = []
                 for item in data["items"]:
                     product = locked_products[item["product"].id]
                     price_sold_at = item["price_sold_at"]
@@ -479,11 +530,20 @@ class SaleViewSet(viewsets.ModelViewSet):
 
                 for product_id, quantity in requested_quantities.items():
                     product = locked_products[product_id]
-                    product.stock_quantity -= quantity
-                    product.save(update_fields=["stock_quantity"])
-                    alert_id = _queue_restock_alert(product)
-                    if alert_id:
-                        alert_ids.append(alert_id)
+                    # The check above ran on the row this transaction read; another
+                    # till may have taken units since. This is the statement that
+                    # actually decides whether the goods were available.
+                    if move_stock(product, -quantity) is None:
+                        raise ValidationError({
+                            "items": [
+                                f"{product.name} ran out while this sale was being written - "
+                                "another till took the last units. Adjust the basket and try again."
+                            ]
+                        })
+                    # Only the queue is written here. The message itself is sent
+                    # by `deliver_alerts` on a schedule, so Twilio never sits
+                    # between a cashier and a finished sale.
+                    _queue_restock_alert(product)
 
                 for payment_data in data.get("payments", []):
                     Payment.objects.create(
@@ -492,12 +552,11 @@ class SaleViewSet(viewsets.ModelViewSet):
                         **payment_data,
                     )
 
-                transaction.on_commit(lambda: _send_restock_alerts(alert_ids))
         except IntegrityError as error:
             if idempotency_key:
                 existing = _receipt_queryset().filter(idempotency_key=idempotency_key).first()
                 if existing:
-                    return Response(SaleReceiptSerializer(existing).data, status=status.HTTP_200_OK)
+                    return _replay_or_conflict(existing, fingerprint)
             raise error
 
         receipt = _receipt_queryset().get(pk=receipt.pk)
@@ -523,11 +582,14 @@ class SaleViewSet(viewsets.ModelViewSet):
                 })
 
             sale = serializer.save(product=product)
-            product.stock_quantity -= sale.quantity
-            product.save(update_fields=["stock_quantity"])
-            alert_id = _queue_restock_alert(product)
-            if alert_id:
-                transaction.on_commit(lambda: _send_restock_alerts([alert_id]))
+            if move_stock(product, -sale.quantity) is None:
+                raise ValidationError({
+                    "quantity": [
+                        f"{product.name} ran out while this sale was being written - "
+                        "another till took the last units."
+                    ]
+                })
+            _queue_restock_alert(product)
 
 
 class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
@@ -539,12 +601,17 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
         branch = _branch_scope(self.request.user, params.get("branch"))
         queryset = branch_queryset(queryset, branch)
 
+        period_start, period_end = _period_range(params)
         start_date = parse_date(params.get("start_date") or "")
         end_date = parse_date(params.get("end_date") or "")
         if params.get("start_date") and not start_date:
             raise ValidationError({"start_date": "Use YYYY-MM-DD format."})
         if params.get("end_date") and not end_date:
             raise ValidationError({"end_date": "Use YYYY-MM-DD format."})
+        # A named period is the shop's own answer to "today", so it outranks any
+        # dates the till computed from its own clock.
+        if period_start or period_end:
+            start_date, end_date = period_start, period_end
         if start_date:
             queryset = queryset.filter(created_at__date__gte=start_date)
         if end_date:
@@ -694,6 +761,17 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
             checkout_request_id = response.get("CheckoutRequestID")
             if not checkout_request_id:
                 raise MpesaError("Safaricom accepted no checkout request ID; payment status is unknown.")
+        except MpesaUnconfirmed as error:
+            # Safaricom may have taken the prompt even though it never answered.
+            # The row is closed because there is no request ID to query, but the
+            # till is told it is unconfirmed rather than "nothing was charged".
+            payment.status = Payment.Status.FAILED
+            payment.result_description = str(error)[:255]
+            payment.save(update_fields=["status", "result_description"])
+            return Response(
+                {"detail": str(error), "confirmed": False},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         except MpesaError as error:
             payment.status = Payment.Status.FAILED
             payment.result_description = str(error)[:255]

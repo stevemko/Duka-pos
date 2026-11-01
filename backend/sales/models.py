@@ -75,6 +75,10 @@ class SaleReceipt(models.Model):
     customer_name = models.CharField(max_length=200, blank=True)
     customer_phone = models.CharField(max_length=30, blank=True)
     idempotency_key = models.CharField(max_length=64, blank=True, null=True, unique=True)
+    # A digest of the basket the key was first used with. A retry after a lost
+    # answer must replay that same sale; the same key carrying a different
+    # customer or tender is a mistake at the counter, not a duplicate request.
+    idempotency_hash = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SaleReceiptQuerySet.as_manager()

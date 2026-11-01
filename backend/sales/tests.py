@@ -1,7 +1,8 @@
 from decimal import Decimal
 from datetime import timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
@@ -12,7 +13,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from products.models import Product
 from .models import Payment, Sale, SaleReceipt
-from .mpesa import MpesaError
+from .mpesa import MpesaError, MpesaUnconfirmed, initiate_stk_push
 
 
 class SaleStockTests(TestCase):
@@ -632,6 +633,58 @@ class IdempotentCheckoutTests(TestCase):
 		self.assertEqual(second.status_code, 201)
 		self.assertEqual(SaleReceipt.objects.count(), 2)
 
+	def test_same_key_with_a_different_basket_is_rejected(self):
+		# A retained key is a retry only while the basket behind it is the same. If
+		# the cashier rings up a different customer or tender under the old
+		# reference, replaying the first receipt would hand this customer someone
+		# else's goods - so the server says no instead.
+		self.client.post(
+			self.checkout_url, self.payload, format="json", HTTP_IDEMPOTENCY_KEY="cart-123"
+		)
+
+		changed = dict(self.payload, customer_name="Wanjiru")
+		response = self.client.post(
+			self.checkout_url, changed, format="json", HTTP_IDEMPOTENCY_KEY="cart-123"
+		)
+
+		self.assertEqual(response.status_code, 409)
+		self.assertIn("different basket", response.data["detail"])
+		self.assertEqual(SaleReceipt.objects.count(), 1)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 8)
+
+	def test_same_key_after_a_change_of_tender_is_rejected(self):
+		self.client.post(
+			self.checkout_url, self.payload, format="json", HTTP_IDEMPOTENCY_KEY="cart-555"
+		)
+
+		# Same key, same goods - but the customer paid by card, not cash. That is a
+		# different sale, and the books cannot show 250 in cash for it.
+		response = self.client.post(
+			self.checkout_url,
+			{
+				"items": self.payload["items"],
+				"payments": [{"amount": "250.00", "method": "card"}],
+			},
+			format="json",
+			HTTP_IDEMPOTENCY_KEY="cart-555",
+		)
+
+		self.assertEqual(response.status_code, 409)
+		self.assertEqual(SaleReceipt.objects.count(), 1)
+
+	def test_a_receipt_saved_before_the_digest_replays_without_argument(self):
+		# Rows already in the books carry no digest, so they have nothing to argue
+		# about: a retry gets the receipt back instead of a 409.
+		legacy = SaleReceipt.objects.create(idempotency_key="cart-old")
+
+		response = self.client.post(
+			self.checkout_url, self.payload, format="json", HTTP_IDEMPOTENCY_KEY="cart-old"
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["id"], str(legacy.id))
+
 
 class MpesaCallbackEdgeTests(TestCase):
 	def setUp(self):
@@ -1200,3 +1253,185 @@ class MarkedPriceAndBranchTests(TestCase):
 		body = response.content.decode("utf-8-sig")
 		self.assertIn("Amina", body)
 		self.assertIn("Town branch", body)
+
+
+class ReportPeriodTests(TestCase):
+	"""A named period is the shop's answer to "which day", so it is worked out on
+	the server. Dates computed by a till whose machine sits in another zone would
+	move real trade into the wrong report."""
+
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="reporter", password="report-pass")
+		self.client.force_authenticate(user=user)
+		self.product = Product.objects.create(
+			name="Cooking fat",
+			sku="PERIOD-FAT",
+			cost_price="100.00",
+			selling_price="150.00",
+			stock_quantity=20,
+		)
+
+	def _checkout(self):
+		response = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"items": [
+					{"product": str(self.product.id), "quantity": 1, "price_sold_at": "150.00"}
+				],
+				"payments": [{"amount": "150.00", "method": "cash"}],
+			},
+			format="json",
+		)
+		self.assertEqual(response.status_code, 201)
+		return response.data["id"]
+
+	def test_named_period_outranks_dates_from_the_till(self):
+		today_id = self._checkout()
+		old_id = self._checkout()
+		SaleReceipt.objects.filter(pk=old_id).update(created_at=timezone.now() - timedelta(days=3))
+
+		response = self.client.get(reverse("receipt-list"), {
+			"period": "today",
+			"start_date": (timezone.localdate() - timedelta(days=10)).isoformat(),
+			"end_date": (timezone.localdate() - timedelta(days=3)).isoformat(),
+		})
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual({row["id"] for row in response.data["results"]}, {today_id})
+
+	def test_yesterday_period_returns_only_yesterday(self):
+		today_id = self._checkout()
+		yesterday_id = self._checkout()
+		SaleReceipt.objects.filter(pk=yesterday_id).update(
+			created_at=timezone.now() - timedelta(days=1)
+		)
+
+		response = self.client.get(reverse("receipt-list"), {"period": "yesterday"})
+
+		self.assertEqual({row["id"] for row in response.data["results"]}, {yesterday_id})
+		self.assertNotIn(today_id, {row["id"] for row in response.data["results"]})
+
+	def test_unknown_period_is_rejected(self):
+		response = self.client.get(reverse("receipt-list"), {"period": "last tuesday"})
+		self.assertEqual(response.status_code, 400)
+
+	def test_analytics_names_the_shop_today(self):
+		self._checkout()
+		response = self.client.get(
+			reverse("sale-analytics"), {"month": timezone.localdate().strftime("%Y-%m")}
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.data["today"], timezone.localdate().isoformat())
+
+
+class MpesaFailureClassTests(TestCase):
+	"""A cashier is told either "nothing was charged" or "we do not know".
+
+	Those are different facts, and mixing them makes a shop send a second prompt
+	over a customer whose phone is already ringing."""
+
+	def _raise(self, error, status_code=None):
+		def fake_urlopen(*args, **kwargs):
+			if status_code is not None:
+				raise HTTPError("https://x", status_code, "boom", {}, BytesIO(b"gateway"))
+			raise error
+
+		with patch("sales.mpesa.urlopen", fake_urlopen), patch(
+			"sales.mpesa._load_config",
+			return_value={
+				"consumer_key": "k",
+				"consumer_secret": "s",
+				"shortcode": "12345",
+				"passkey": "p",
+				"callback_url": "https://shop.example/callback",
+				"callback_token": "a-long-random-token",
+				"environment": "sandbox",
+			},
+		), patch("sales.mpesa._access_token", return_value="token"):
+			try:
+				initiate_stk_push(
+					Payment(amount=Decimal("100.00")), "0794671494"
+				)
+			except MpesaError as error:
+				return error
+		return None
+
+	def test_gateway_answer_of_five_hundred_is_unconfirmed(self):
+		self.assertIsInstance(self._raise(None, 500), MpesaUnconfirmed)
+
+	def test_timeout_is_unconfirmed(self):
+		self.assertIsInstance(self._raise(TimeoutError(), None), MpesaUnconfirmed)
+
+	def test_no_connection_at_all_is_a_clean_no(self):
+		error = self._raise(URLError("no route to host"), None)
+		self.assertIsInstance(error, MpesaError)
+		self.assertNotIsInstance(error, MpesaUnconfirmed)
+		self.assertIn("Nothing has been charged", str(error))
+
+	def test_refused_request_is_a_clean_no(self):
+		error = self._raise(None, 400)
+		self.assertNotIsInstance(error, MpesaUnconfirmed)
+		self.assertIn("refused", str(error))
+
+
+class UnconfirmedStkPushTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		user = get_user_model().objects.create_user(username="stk", password="stk-pass")
+		self.client.force_authenticate(user=user)
+		self.product = Product.objects.create(
+			name="Bulb",
+			sku="STK-BULB",
+			cost_price="50.00",
+			selling_price="100.00",
+			stock_quantity=10,
+		)
+
+	@patch("sales.views.initiate_stk_push")
+	def test_prompt_safaricom_never_answered_is_reported_as_unconfirmed(self, initiate):
+		initiate.side_effect = MpesaUnconfirmed(
+			"Safaricom did not answer (HTTP 500). Nothing is confirmed by this response."
+		)
+		receipt = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"customer_phone": "0794671494",
+				"items": [{"product": str(self.product.id), "quantity": 1, "price_sold_at": "100.00"}],
+			},
+			format="json",
+		)
+		response = self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": receipt.data["id"]}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertIs(response.data["confirmed"], False)
+		payment = Payment.objects.get(receipt_id=receipt.data["id"])
+		self.assertEqual(payment.status, Payment.Status.FAILED)
+		self.assertIn("Nothing is confirmed", payment.result_description)
+
+	@patch("sales.views.initiate_stk_push")
+	def test_prompt_safaricom_refused_keeps_the_plain_message(self, initiate):
+		initiate.side_effect = MpesaError("Safaricom refused the request (HTTP 400).")
+		receipt = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"customer_phone": "0794671494",
+				"items": [{"product": str(self.product.id), "quantity": 1, "price_sold_at": "100.00"}],
+			},
+			format="json",
+		)
+		response = self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": receipt.data["id"]}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertNotIn("confirmed", response.data)

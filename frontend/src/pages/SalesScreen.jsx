@@ -507,7 +507,17 @@ export default function SalesScreen() {
       loadRecentReceipts();
       if (wantsStk) askStk(receipt, Number(fromCents(tenderedCents)), stkPhoneForSale);
     } catch (error) {
-      if (!error.response || error.response.status >= 500) {
+      if (error?.response?.status === 409) {
+        // The server already recorded a different sale under this reference. Drop
+        // the reference so the next send is a new sale, and say where the first one
+        // went: it is on the customer's receipt, not lost.
+        invalidateKey();
+        setStatus({
+          type: "error",
+          title: "Checkout blocked",
+          message: `${apiErrorMessage(error, "This sale reference was already used.")} The sale it was used for is already recorded - find it in Recent receipts.`,
+        });
+      } else if (!error.response || error.response.status >= 500) {
         // The receipt may already be saved server-side. Keep the idempotency key
         // so the retry replays it instead of charging the customer twice.
         loadRecentReceipts();
@@ -588,12 +598,18 @@ export default function SalesScreen() {
       });
       watchPayment(receiptId);
     } catch (error) {
+      // Safaricom sometimes takes a prompt and never answers. Telling the cashier
+      // "nothing has been charged" in that case would send a second prompt to a
+      // customer whose phone is already ringing.
+      const unconfirmed = error?.response?.data?.confirmed === false;
       setPayStatus({
         receiptId,
         state: "not_sent",
         balance: Number(stkTarget.amount || stkTarget.receipt.balance || 0),
         code: "",
-        message: `${apiErrorMessage(error, "Could not send the M-Pesa prompt.")} Nothing has been charged.`,
+        message: unconfirmed
+          ? `${apiErrorMessage(error, "Safaricom did not answer.")} Wait a minute before sending another: the prompt may still reach the customer's phone. If it arrives, take the PIN, or settle this sale in cash.`
+          : `${apiErrorMessage(error, "Could not send the M-Pesa prompt.")} Nothing has been charged.`,
       });
     } finally {
       setSendingStk(false);

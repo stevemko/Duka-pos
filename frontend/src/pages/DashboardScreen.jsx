@@ -81,9 +81,13 @@ export default function DashboardScreen() {
   const lowStock = data?.lowStock || [];
 
   const now = new Date();
-  const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
-    now.getDate(),
-  ).padStart(2, "0")}`;
+  // The shop's server names the day: a till machine left in another zone would
+  // otherwise read yesterday's row out of the month's totals and call it today.
+  const todayKey =
+    analytics?.today ||
+    `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      now.getDate(),
+    ).padStart(2, "0")}`;
   const today = analytics?.daily_totals?.find((day) => day.date === todayKey);
 
   const daily = analytics?.daily_totals || [];

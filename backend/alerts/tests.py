@@ -1,8 +1,11 @@
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import Branch, StaffProfile
@@ -92,3 +95,104 @@ class RestockAlertTests(TestCase):
 		response = self.client.get(reverse("alert-list"))
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual([row["product_name"] for row in response.data["results"]], ["Dash camera"])
+
+	def test_a_cashier_without_a_branch_sees_the_main_shop_only(self):
+		# Nobody gave this cashier a shop, which is not the same as giving them all
+		# of them: only a manager with no branch is meant to read the whole chain.
+		# The fallback is the MAIN branch every shop already has, so a product left
+		# without a branch counts as the main shop's.
+		ring = Branch.objects.create(name="Ring road", code="ALERT-RING2")
+		other = Product.objects.create(
+			name="Dash camera",
+			sku="ALERT-003",
+			branch=ring,
+			cost_price="100.00",
+			selling_price="150.00",
+			stock_quantity=1,
+			reorder_threshold=5,
+		)
+		StockAlert.objects.create(product=self.product, stock_at_trigger=0)
+		StockAlert.objects.create(product=other, stock_at_trigger=1)
+
+		response = self.client.get(reverse("alert-list"))
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual([row["product_name"] for row in response.data["results"]], ["Spotlight"])
+
+
+class DeliverAlertsCommandTests(TestCase):
+	def setUp(self):
+		self.product = Product.objects.create(
+			name="Light strip",
+			sku="ALERT-003",
+			cost_price="100.00",
+			selling_price="150.00",
+			stock_quantity=2,
+			reorder_threshold=5,
+		)
+
+	def _deliver(self, **options):
+		with patch("alerts.management.commands.deliver_alerts.send_restock_whatsapp") as send:
+			call_command("deliver_alerts", **options)
+		return send
+
+	def test_checkout_does_not_message_twilio_itself(self):
+		client = APIClient()
+		user = get_user_model().objects.create_user(username="till", password="alert-pass-3")
+		client.force_authenticate(user)
+		with patch("alerts.whatsapp.Client") as twilio:
+			response = client.post(
+				reverse("sale-checkout"),
+				{
+					"items": [
+						{
+							"product": str(self.product.id),
+							"quantity": 2,
+							"price_sold_at": "150.00",
+						}
+					],
+					"payments": [{"amount": "300.00", "method": "cash"}],
+				},
+				format="json",
+			)
+		self.assertEqual(response.status_code, 201)
+		twilio.assert_not_called()
+		self.assertEqual(StockAlert.objects.filter(whatsapp_sent=False).count(), 1)
+
+	def test_deliver_sends_the_queued_alert_and_marks_it(self):
+		StockAlert.objects.create(product=self.product, stock_at_trigger=0)
+		send = self._deliver()
+		send.assert_called_once_with(self.product)
+		self.assertTrue(StockAlert.objects.get().whatsapp_sent)
+
+	def test_a_restock_between_sale_and_delivery_sends_nothing(self):
+		StockAlert.objects.create(product=self.product, stock_at_trigger=0)
+		self.product.stock_quantity = 40
+		self.product.save(update_fields=["stock_quantity"])
+		send = self._deliver()
+		send.assert_not_called()
+		self.assertTrue(StockAlert.objects.get().whatsapp_sent)
+
+	def test_one_shortage_is_one_message(self):
+		StockAlert.objects.create(product=self.product, stock_at_trigger=2)
+		StockAlert.objects.create(product=self.product, stock_at_trigger=1)
+		send = self._deliver()
+		self.assertEqual(send.call_count, 1)
+		self.assertEqual(StockAlert.objects.filter(whatsapp_sent=False).count(), 0)
+
+	def test_a_failed_send_stays_queued_for_the_next_run(self):
+		StockAlert.objects.create(product=self.product, stock_at_trigger=0)
+		with patch(
+			"alerts.management.commands.deliver_alerts.send_restock_whatsapp", return_value=False
+		):
+			call_command("deliver_alerts")
+		self.assertFalse(StockAlert.objects.get().whatsapp_sent)
+
+	def test_alerts_older_than_a_day_are_left_alone(self):
+		alert = StockAlert.objects.create(product=self.product, stock_at_trigger=0)
+		StockAlert.objects.filter(pk=alert.pk).update(
+			triggered_at=timezone.now() - timedelta(hours=30)
+		)
+		send = self._deliver()
+		send.assert_not_called()
+		self.assertFalse(StockAlert.objects.get().whatsapp_sent)
