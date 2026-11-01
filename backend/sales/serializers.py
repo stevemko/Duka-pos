@@ -2,7 +2,15 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from .models import Customer, Payment, Sale, SaleReceipt, normalize_customer_phone
+from .models import (
+    Customer,
+    Payment,
+    Sale,
+    SaleReceipt,
+    SaleReturn,
+    SaleReturnItem,
+    normalize_customer_phone,
+)
 from products.models import Product
 
 
@@ -53,10 +61,51 @@ class PaymentSerializer(serializers.ModelSerializer):
         return payment.created_by.get_full_name() or payment.created_by.get_username()
 
 
+class SaleReturnItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    sale_id = serializers.UUIDField(source="sale.id", read_only=True)
+
+    class Meta:
+        model = SaleReturnItem
+        fields = [
+            "id", "sale_id", "product", "product_name", "quantity",
+            "unit_price", "total", "created_at",
+        ]
+        read_only_fields = fields
+
+
+class SaleReturnSerializer(serializers.ModelSerializer):
+    items = SaleReturnItemSerializer(many=True, read_only=True)
+    taken_by_name = serializers.SerializerMethodField()
+    method_label = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SaleReturn
+        fields = [
+            "id", "value", "refund", "method", "method_label", "reference", "reason",
+            "taken_by_name", "items", "created_at",
+        ]
+        read_only_fields = fields
+
+    def get_taken_by_name(self, entry_return):
+        if not entry_return.created_by:
+            return ""
+        return entry_return.created_by.get_full_name() or entry_return.created_by.get_username()
+
+    def get_method_label(self, entry_return):
+        if not entry_return.method:
+            return ""
+        return dict(Payment.Method.choices).get(entry_return.method, entry_return.method)
+
+
 class SaleReceiptSerializer(serializers.ModelSerializer):
     items = SaleSerializer(many=True, read_only=True)
     payments = PaymentSerializer(many=True, read_only=True)
+    returns = SaleReturnSerializer(many=True, read_only=True)
     total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    returned_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    net_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    refunded_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     amount_paid = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     balance = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     payment_status = serializers.CharField(read_only=True)
@@ -67,7 +116,8 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
         model = SaleReceipt
         fields = [
             "id", "branch", "branch_name", "created_by_name", "customer", "customer_name",
-            "customer_phone", "items", "payments", "total", "amount_paid", "balance",
+            "customer_phone", "items", "payments", "returns", "total", "returned_total",
+            "net_total", "refunded_total", "amount_paid", "balance",
             "payment_status", "created_at", "closed_at",
         ]
 
@@ -202,6 +252,46 @@ class ReceiptPaymentSerializer(serializers.Serializer):
 
     def validate(self, data):
         return _validate_payment_reference(data)
+
+
+class ReturnItemSerializer(serializers.Serializer):
+    """One line of a return: which sale line came back, and how many of it."""
+
+    sale = serializers.PrimaryKeyRelatedField(queryset=Sale.objects.all())
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class ReturnCreateSerializer(serializers.Serializer):
+    """The basket a customer brought back.
+
+    Only the lines and the reason are typed. What the goods are worth comes off the
+    bill at their original price, and how much cash goes back over the counter is
+    worked out from what was paid against what is now owed - a refund the till can
+    choose is a refund the till can get wrong.
+    """
+
+    items = ReturnItemSerializer(many=True, allow_empty=False)
+    reason = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    refund_method = serializers.ChoiceField(
+        choices=[
+            choice for choice in Payment.Method.choices
+            if choice[0] != Payment.Method.MPESA_STK
+        ],
+        required=False,
+        allow_blank=True,
+    )
+    reference = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    idempotency_key = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
+    def validate(self, data):
+        if (
+            data.get("refund_method") == Payment.Method.MPESA_PAYBILL
+            and not (data.get("reference") or "").strip()
+        ):
+            raise serializers.ValidationError({
+                "reference": "Enter the M-Pesa confirmation code for this refund."
+            })
+        return data
 
 
 class StkPushSerializer(serializers.Serializer):

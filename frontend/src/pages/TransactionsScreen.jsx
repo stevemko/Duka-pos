@@ -194,15 +194,20 @@ export default function TransactionsScreen() {
     );
   }
 
+  // The cards have to describe the money actually in the drawer: goods that
+  // came back are no longer a sale, and a refund handed over the counter is no
+  // longer cash the shop kept.
   const visibleTotals = useMemo(
     () =>
       receipts.reduce(
         (totals, receipt) => ({
-          total: totals.total + Number(receipt.total || 0),
-          paid: totals.paid + Number(receipt.amount_paid || 0),
+          total: totals.total + Number(receipt.net_total ?? receipt.total ?? 0),
+          paid: totals.paid + Number(receipt.amount_paid || 0) - Number(receipt.refunded_total || 0),
           balance: totals.balance + Number(receipt.balance || 0),
+          returned: totals.returned + Number(receipt.returned_total || 0),
+          refunded: totals.refunded + Number(receipt.refunded_total || 0),
         }),
-        { total: 0, paid: 0, balance: 0 },
+        { total: 0, paid: 0, balance: 0, returned: 0, refunded: 0 },
       ),
     [receipts],
   );
@@ -248,12 +253,22 @@ export default function TransactionsScreen() {
           value={`KES ${money(tab === "credits" ? credits?.outstanding_total : visibleTotals.total)}`}
           icon="receipt"
           tone="brand"
+          hint={
+            tab === "credits" || !visibleTotals.returned
+              ? undefined
+              : `After KES ${money(visibleTotals.returned)} of goods came back.`
+          }
         />
         <StatCard
           label={tab === "credits" ? "Customers owing" : "Collected in view"}
           value={tab === "credits" ? credits?.customer_count ?? 0 : `KES ${money(visibleTotals.paid)}`}
           icon="wallet"
           tone="success"
+          hint={
+            tab === "credits" || !visibleTotals.refunded
+              ? undefined
+              : `KES ${money(visibleTotals.refunded)} was handed back to customers.`
+          }
         />
         <StatCard
           label={tab === "credits" ? "Credit receipts" : "Balance in view"}
@@ -433,6 +448,11 @@ export default function TransactionsScreen() {
                     </Td>
                     <Td align="right" className="tabular whitespace-nowrap">
                       KES {money(receipt.total)}
+                      {Number(receipt.returned_total) > 0 && (
+                        <p className="text-xs font-normal text-rose-700">
+                          −{money(receipt.returned_total)} back
+                        </p>
+                      )}
                     </Td>
                     <Td align="right" className="tabular whitespace-nowrap text-emerald-700">
                       KES {money(receipt.amount_paid)}
@@ -624,11 +644,17 @@ function ClosePeriodDialog({ onClose, branchQuery, onClosed }) {
 }
 
 function ReceiptDetail({ receipt, onClose, onUpdated, onRefresh }) {
+  const { canManage } = useAuth();
   const [mode, setMode] = useState("view");
   const [amount, setAmount] = useState(receipt ? String(receipt.balance || "") : "");
   const [method, setMethod] = useState("cash");
   const [reference, setReference] = useState("");
   const [phone, setPhone] = useState(receipt?.customer_phone || "");
+  const [quantities, setQuantities] = useState({});
+  const [returnReason, setReturnReason] = useState("");
+  const [refundMethod, setRefundMethod] = useState("cash");
+  const [refundReference, setRefundReference] = useState("");
+  const [returnKey, setReturnKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState(null);
   const [printReceipt, setPrintReceipt] = useState(null);
@@ -646,6 +672,97 @@ function ReceiptDetail({ receipt, onClose, onUpdated, onRefresh }) {
   if (!receipt) return null;
 
   const balance = Number(receipt.balance || 0);
+  const returnedTotal = Number(receipt.returned_total || 0);
+
+  // How much of each line is still out, so the form can never offer more than
+  // left the shelf. The server checks this again; the till should not be able to
+  // type an impossible return.
+  const backByLine = {};
+  (receipt.returns || []).forEach((entry) =>
+    (entry.items || []).forEach((item) => {
+      backByLine[item.sale_id] = (backByLine[item.sale_id] || 0) + Number(item.quantity);
+    }),
+  );
+  const returnLines = (receipt.items || []).map((item) => ({
+    ...item,
+    stillOut: Number(item.quantity) - (backByLine[item.id] || 0),
+  }));
+  const anythingOut = returnLines.some((line) => line.stillOut > 0);
+  const returnCount = returnLines.reduce(
+    (count, line) => count + Math.min(quantities[line.id] || 0, line.stillOut),
+    0,
+  );
+  const returnValue = returnLines.reduce(
+    (sum, line) =>
+      sum + Number(line.price_sold_at) * Math.min(quantities[line.id] || 0, line.stillOut),
+    0,
+  );
+  // The same arithmetic the server uses: what the bill is worth once these goods
+  // are back, against what the customer already handed in. The rest is what the
+  // shop owes back over the counter.
+  const owedAfter =
+    Number(receipt.total) - returnedTotal - returnValue;
+  const predictedRefund = Math.max(
+    0,
+    Number(receipt.amount_paid) - Number(receipt.refunded_total || 0) - owedAfter,
+  );
+
+  function openReturn() {
+    setQuantities({});
+    setReturnReason("");
+    setRefundReference("");
+    setRefundMethod("cash");
+    setReturnKey(window.crypto?.randomUUID?.() || "");
+    setMode("return");
+  }
+
+  async function recordReturn(event) {
+    event.preventDefault();
+    setNotice(null);
+    const items = returnLines
+      .filter((line) => (quantities[line.id] || 0) > 0)
+      .map((line) => ({ sale: line.id, quantity: Math.min(quantities[line.id], line.stillOut) }));
+    if (!items.length) {
+      setNotice({ tone: "error", message: "Say how many of each item came back." });
+      return;
+    }
+    setSaving(true);
+    try {
+      const updated = await receiptsApi.addReturn(
+        receipt.id,
+        {
+          items,
+          reason: returnReason.trim(),
+          ...(predictedRefund > 0
+            ? {
+                refund_method: refundMethod,
+                ...(refundReference.trim() ? { reference: refundReference.trim() } : {}),
+              }
+            : {}),
+        },
+        returnKey,
+      );
+      onUpdated(updated);
+      setMode("view");
+      setQuantities({});
+      setReturnKey("");
+      setNotice({
+        tone: "success",
+        message:
+          Number(updated.refunded_total) > Number(receipt.refunded_total || 0)
+            ? `Return recorded and KES ${money(updated.refunded_total)} handed back.`
+            : "Return recorded. The balance on this bill went down.",
+      });
+      onRefresh?.();
+    } catch (requestError) {
+      setNotice({
+        tone: "error",
+        message: apiErrorMessage(requestError, "Could not record the return."),
+      });
+    } finally {
+      setSaving(false);
+    }
+  }
 
   function print() {
     setPrintReceipt(receipt);
@@ -760,6 +877,11 @@ function ReceiptDetail({ receipt, onClose, onUpdated, onRefresh }) {
             <Button variant="secondary" icon="printer" onClick={print}>
               Print
             </Button>
+            {canManage && anythingOut && mode === "view" && (
+              <Button variant="secondary" icon="arrowDownLeft" onClick={openReturn}>
+                Take a return
+              </Button>
+            )}
             {balance > 0 && mode === "view" && (
               <>
                 <Button variant="secondary" icon="spark" onClick={() => setMode("stk")}>
@@ -824,11 +946,23 @@ function ReceiptDetail({ receipt, onClose, onUpdated, onRefresh }) {
             </tbody>
           </TableShell>
 
-          <div className="grid gap-3 rounded-xl border border-ink-100 bg-white p-4 text-sm sm:grid-cols-3">
+          <div
+            className={`grid gap-3 rounded-xl border border-ink-100 bg-white p-4 text-sm ${
+              returnedTotal > 0 ? "sm:grid-cols-4" : "sm:grid-cols-3"
+            }`}
+          >
             <div>
-              <p className="text-xs uppercase tracking-wide text-ink-400">Total</p>
+              <p className="text-xs uppercase tracking-wide text-ink-400">Billed</p>
               <p className="tabular mt-1 text-lg font-semibold text-ink-950">KES {money(receipt.total)}</p>
             </div>
+            {returnedTotal > 0 && (
+              <div>
+                <p className="text-xs uppercase tracking-wide text-ink-400">Returned</p>
+                <p className="tabular mt-1 text-lg font-semibold text-rose-700">
+                  KES {money(receipt.returned_total)}
+                </p>
+              </div>
+            )}
             <div>
               <p className="text-xs uppercase tracking-wide text-ink-400">Paid</p>
               <p className="tabular mt-1 text-lg font-semibold text-emerald-700">
@@ -905,6 +1039,155 @@ function ReceiptDetail({ receipt, onClose, onUpdated, onRefresh }) {
                 </Button>
                 <Button type="submit" loading={saving}>
                   Save payment
+                </Button>
+              </div>
+            </form>
+          )}
+
+          {(receipt.returns || []).length > 0 && (
+            <div>
+              <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-ink-400">
+                Returns taken
+              </p>
+              <ul className="divide-y divide-ink-100 rounded-xl border border-ink-100">
+                {(receipt.returns || []).map((entry) => (
+                  <li
+                    key={entry.id}
+                    className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-sm"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-medium text-ink-800">
+                        {(entry.items || [])
+                          .map((item) => `${item.quantity} x ${item.product_name}`)
+                          .join(", ")}
+                      </p>
+                      <p className="text-xs text-ink-400">
+                        {formatDateTime(entry.created_at)}
+                        {entry.taken_by_name ? ` · ${entry.taken_by_name}` : ""}
+                        {entry.reason ? ` · ${entry.reason}` : ""}
+                      </p>
+                      {Number(entry.refund) > 0 && (
+                        <p className="text-xs text-rose-700">
+                          Refunded KES {money(entry.refund)}
+                          {entry.method_label ? ` · ${entry.method_label}` : ""}
+                          {entry.reference ? ` · ${entry.reference}` : ""}
+                        </p>
+                      )}
+                    </div>
+                    <span className="tabular font-semibold text-ink-900">
+                      KES {money(entry.value)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {mode === "return" && (
+            <form
+              onSubmit={recordReturn}
+              className="space-y-3 rounded-xl border border-rose-200 bg-rose-50/60 p-4"
+            >
+              <p className="text-sm font-semibold text-ink-900">Take goods back</p>
+              <p className="text-xs text-ink-500">
+                The bill itself is never rewritten. What comes back goes onto the shelf again and the
+                money is worked out from what the customer already paid.
+              </p>
+
+              <ul className="divide-y divide-rose-100 rounded-xl border border-rose-100 bg-white">
+                {returnLines.map((line) => (
+                  <li key={line.id} className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+                    <div className="min-w-0">
+                      <p className="font-medium text-ink-800">{line.product_name}</p>
+                      <p className="text-xs text-ink-400">
+                        {line.stillOut > 0
+                          ? `${line.stillOut} of ${line.quantity} still out at KES ${money(line.price_sold_at)}`
+                          : "Everything on this line has already come back"}
+                      </p>
+                    </div>
+                    <Input
+                      className="w-20 text-right"
+                      type="number"
+                      inputMode="numeric"
+                      min="0"
+                      max={line.stillOut}
+                      disabled={line.stillOut <= 0}
+                      placeholder="0"
+                      value={quantities[line.id] ?? ""}
+                      onChange={(event) => {
+                        const picked = Math.max(
+                          0,
+                          Math.min(Number(event.target.value) || 0, line.stillOut),
+                        );
+                        setQuantities((current) => ({ ...current, [line.id]: picked }));
+                      }}
+                    />
+                  </li>
+                ))}
+              </ul>
+
+              <Field label="Reason (optional)">
+                <Input
+                  value={returnReason}
+                  onChange={(event) => setReturnReason(event.target.value)}
+                  placeholder="Wrong item, faulty, changed their mind..."
+                  autoFocus
+                />
+              </Field>
+
+              {predictedRefund > 0 && (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="How the money goes back">
+                    <Select value={refundMethod} onChange={(event) => setRefundMethod(event.target.value)}>
+                      <option value="cash">Cash</option>
+                      <option value="mobile_money">Mobile money</option>
+                      <option value="mpesa_paybill">M-Pesa Paybill</option>
+                      <option value="card">Card</option>
+                      <option value="bank_transfer">Bank transfer</option>
+                    </Select>
+                  </Field>
+                  <Field
+                    label="Confirmation code"
+                    hint={
+                      refundMethod === "mpesa_paybill"
+                        ? "Required for a Paybill refund."
+                        : "Only needed when money left through a service."
+                    }
+                  >
+                    <Input
+                      value={refundReference}
+                      onChange={(event) => setRefundReference(event.target.value)}
+                      placeholder="M-Pesa code, slip no..."
+                    />
+                  </Field>
+                </div>
+              )}
+
+              <div className="space-y-1.5 rounded-xl bg-white px-4 py-3 text-sm ring-1 ring-rose-100">
+                <div className="flex justify-between">
+                  <span className="text-ink-500">Value of goods coming back</span>
+                  <span className="tabular font-semibold text-ink-900">KES {money(returnValue)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-ink-500">Bill after this return</span>
+                  <span className="tabular font-semibold text-ink-900">
+                    KES {money(Math.max(0, owedAfter))}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-ink-500">Cash to hand back</span>
+                  <span className="tabular font-semibold text-rose-700">
+                    KES {money(predictedRefund)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <Button variant="secondary" onClick={() => setMode("view")}>
+                  Cancel
+                </Button>
+                <Button type="submit" loading={saving} disabled={returnCount === 0}>
+                  Record return
                 </Button>
               </div>
             </form>

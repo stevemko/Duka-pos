@@ -21,7 +21,7 @@ duka-pos/
 | Sell | Server-paginated product picker with search, category filter and Enter-to-scan SKU; cart, cash/change, Paybill, STK prompt, mobile money, card, bank, credit and part-payment; printable receipt after every sale. |
 | Wholesale cost floor | Retail is the marked price; wholesale is the initial cost. Selling below retail is allowed (with a discount note), but a sale below wholesale cost is blocked in the browser, the API and the database with a red alert. |
 | Inventory | Thousands of products with fast server search and "load more"; stock, wholesale cost, retail price, margin, images, low-stock filters, CSV price-list import and template, per-branch stock. |
-| Transactions | Every receipt is kept forever: date, customer, cashier, items, payments, balance, status. Filter by day/week/month, search, export CSV. The super admin can close an old period so settled bills leave the daily list without being deleted. |
+| Transactions | Every receipt is kept forever: date, customer, cashier, items, payments, returns, balance, status. Filter by day/week/month, search, export CSV. A manager can take goods back against any open bill, which restocks the shelf and nets the day's takings. The super admin can close an old period so settled bills leave the daily list without being deleted. |
 | Credits | Outstanding balances per customer, one-click settle, M-Pesa prompt from the receipt. |
 | Expenses | Rent, salaries, stock, transport and other money-out entries, with category summaries and net profit. |
 | Team & passwords | Only the super admin creates logins, assigns roles and reset passwords. Managers open branches and oversee shop operations; everyone can change their own password. |
@@ -33,9 +33,9 @@ duka-pos/
 - **Super admin** (`is_superuser=True`): the only role that creates accounts,
   assigns roles, resets passwords, deactivates logins and closes an old trading
   period. Also has full access to money, expenses, branches and all reports.
-- **Manager** (`is_staff=True`): full shop oversight: sells, manages
-  inventory, expenses, branches and all-branch reports. Cannot create staff
-  accounts or reset other people's passwords.
+- **Manager** (`is_staff=True`): full shop oversight: sells, takes goods back
+  against a receipt, manages inventory, expenses, branches and all-branch
+  reports. Cannot create staff accounts or reset other people's passwords.
 - **Cashier**: sells and views inventory/records for their assigned branch.
   Wholesale cost and profit are hidden; they still see the minimum sell price
   (wholesale cost) so loss-making sales are blocked.
@@ -110,6 +110,17 @@ restart Vite.
   open any receipt to print, then **Export CSV** for your records/accountant.
 - **Month end**: **Dashboard**, choose the month, export the transaction CSV
   and review gross profit, expenses and net profit.
+- **Take a return** (manager or super admin): on **Transactions**, open the
+  receipt and press **Take a return**. Tick how many of each line came back and
+  say why. The goods go onto the shelf again, the bill keeps every original
+  line, and a return row records what came back at the price it was sold for.
+  The shop works out the refund from what the customer already paid against what
+  they now owe, so the till cannot type in a number: on a paid bill that amount
+  is handed back over the counter, and on a credit bill it simply reduces the
+  debt with no cash moving. Returns are counted on the day they are taken, so
+  today's takings show what stayed in the till. Each bill settles on its own: a
+  refund on one bill never reduces what a different bill still owes, and a
+  return waits while an M-Pesa request on that bill is still waiting for a PIN.
 - **Closing an old period** (super admin only): on **Transactions**, set the
   date range you have finished with, **Export CSV** and keep that file, then
   **Close period** and give it the last day of the period. Settled bills leave
@@ -122,8 +133,10 @@ restart Vite.
 
 Sales and payments are immutable: once saved they cannot be edited or deleted,
 which keeps the books auditable. Mistakes are corrected with a new entry, not
-by erasing history. Closing a period works the same way: it hides paperwork
-from the counter's view, it does not destroy it.
+by erasing history — a return is one of those entries, so the original bill
+still reads exactly as it was rung up. Closing a period works the same way: it
+hides paperwork from the counter's view, it does not destroy it. A bill in a
+closed period cannot take a return until the period is reopened.
 
 ## M-Pesa: sandbox → real Paybill
 
@@ -344,6 +357,12 @@ The shop trades from one machine with one database file, so the copy is the plan
    warns (`config.W001`) when it spots one. To move it: stop the server, set
    `DATABASE_PATH=C:\ShopData\greenlight.sqlite3` in `backend/.env`, copy
    `db.sqlite3` there, then start again and sign in.
+
+   **Already done on the shop machine**: `.env` points at
+   `C:\ShopData\greenlight.sqlite3`, and that is the only file the server writes.
+   The `backend\db.sqlite3` inside the project is the spare taken on the day it
+   moved; it is not live and must not be edited or pointed at again, because the
+   two would then hold different books.
 2. **Copy the books every night** with a scheduled job:
 
 ```bat

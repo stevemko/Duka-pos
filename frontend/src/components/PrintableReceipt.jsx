@@ -11,6 +11,9 @@ export default function PrintableReceipt({ receipt, title = "SALES RECEIPT" }) {
   const phone = shop?.phone || SHOP_PHONE;
   const paybill = shop?.paybill || "";
   const balance = Number(receipt.balance);
+  const returns = receipt.returns || [];
+  const returnedValue = Number(receipt.returned_total || 0);
+  const refundedValue = Number(receipt.refunded_total || 0);
 
   return (
     <article className="print-receipt" aria-label="Receipt for printing">
@@ -50,15 +53,54 @@ export default function PrintableReceipt({ receipt, title = "SALES RECEIPT" }) {
           ))}
         </tbody>
       </table>
+      {returns.length > 0 && (
+        <>
+          <div className="receipt-rule" />
+          <p>
+            <strong>Returned</strong>
+          </p>
+          {returns.map((entry) => (
+            <div key={entry.id}>
+              {entry.items.map((item) => (
+                <p key={item.id} className="receipt-row">
+                  <span>
+                    {item.product_name} <small>{`× ${item.quantity}`}</small>
+                    {entry.reason ? ` (${entry.reason})` : ""}
+                  </span>
+                  <span>KES {item.total}</span>
+                </p>
+              ))}
+            </div>
+          ))}
+        </>
+      )}
       <div className="receipt-rule" />
       <p className="receipt-row">
         <strong>Total</strong>
         <strong>KES {receipt.total}</strong>
       </p>
+      {returnedValue > 0 && (
+        <p className="receipt-row">
+          <span>Returned</span>
+          <span>KES {receipt.returned_total}</span>
+        </p>
+      )}
+      {returnedValue > 0 && (
+        <p className="receipt-row">
+          <span>Bill after returns</span>
+          <span>KES {receipt.net_total}</span>
+        </p>
+      )}
       <p className="receipt-row">
         <span>Paid</span>
         <span>KES {receipt.amount_paid}</span>
       </p>
+      {refundedValue > 0 && (
+        <p className="receipt-row">
+          <span>Handed back</span>
+          <span>KES {receipt.refunded_total}</span>
+        </p>
+      )}
       <p className="receipt-row">
         <span>Balance</span>
         <span>KES {receipt.balance}</span>

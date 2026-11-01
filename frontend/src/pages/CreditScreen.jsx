@@ -537,8 +537,8 @@ export default function CreditScreen() {
                   <tr>
                     <Th>Date</Th>
                     <Th>Entry</Th>
-                    <Th align="right">Goods out</Th>
-                    <Th align="right">Money in</Th>
+                    <Th align="right">Added to debt</Th>
+                    <Th align="right">Taken off debt</Th>
                     <Th align="right">Owed after</Th>
                   </tr>
                 </thead>
@@ -547,7 +547,11 @@ export default function CreditScreen() {
                     <tr key={`${entry.reference}-${index}`}>
                       <Td>{day(entry.date)}</Td>
                       <Td>
-                        {entry.type === "sale" ? "Goods billed" : "Payment"}
+                        {entry.type === "sale"
+                          ? "Goods billed"
+                          : entry.type === "return"
+                            ? "Goods returned"
+                            : "Payment"}
                         <span className="block text-xs text-ink-500">{entry.description}</span>
                       </Td>
                       <Td align="right" className="tabular">

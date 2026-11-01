@@ -10,7 +10,20 @@ from decimal import Decimal
 from django.db.models import Count
 from rest_framework.exceptions import ValidationError
 
-from .models import Customer, Payment, SaleReceipt, normalize_customer_phone
+from .models import Customer, Payment, SaleReceipt, SaleReturn, normalize_customer_phone
+
+
+def _return_description(entry_return):
+    goods = ", ".join(
+        f"{item.quantity} x {item.product.name}" for item in entry_return.items.all()
+    )
+    reason = f" ({entry_return.reason})" if entry_return.reason else ""
+    # Say so when part of the goods had already been paid for: the bill only came
+    # down by the rest, and the reader needs to know where the other part went.
+    handed_back = (
+        f" - {entry_return.refund:.2f} handed back" if entry_return.refund else ""
+    )
+    return f"Returned: {goods}{reason}{handed_back}"
 
 
 def find_customer(branch, customer_id=None, phone=""):
@@ -69,7 +82,9 @@ def settle_account_payment(customer, amount, method, reference="", taken_by=None
     for receipt in open_receipts:
         if remaining <= 0:
             break
-        due = receipt.total - receipt.amount_paid
+        # The net, not the billed total: goods the shop took back are no longer a
+        # debt, and settling them again would take money the customer does not owe.
+        due = receipt.net_total - receipt.amount_paid
         if due <= 0:
             continue
         part = due if due < remaining else remaining
@@ -130,6 +145,27 @@ def ledger(customer, limit=400):
                 "description": payment.reference or payment.get_method_display(),
                 "debit": Decimal("0.00"),
                 "credit": payment.amount,
+            }
+        )
+
+    returns = (
+        SaleReturn.objects.filter(receipt__customer=customer)
+        .prefetch_related("items__product")
+        .order_by("created_at")[:limit]
+    )
+    for entry_return in returns:
+        # Only the part that was still owed clears the debt. Cash already taken for
+        # these goods went back over the counter with them, so counting the whole
+        # return as a credit would clear a debt the customer never had on this bill
+        # and could hide what another bill still owes.
+        entries.append(
+            {
+                "date": entry_return.created_at,
+                "type": "return",
+                "reference": str(entry_return.receipt_id),
+                "description": _return_description(entry_return),
+                "debit": Decimal("0.00"),
+                "credit": entry_return.value - entry_return.refund,
             }
         )
 

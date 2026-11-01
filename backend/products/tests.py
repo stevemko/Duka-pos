@@ -281,6 +281,35 @@ class ProductMergeTests(TestCase):
 		self.assertEqual(kept.sales.count(), 1)
 		self.assertEqual(StockAlert.objects.count(), 0)
 
+	def test_merge_carries_taken_back_goods_with_the_product(self):
+		"""Goods already handed back belong to the same shelf item, so a merge has
+		to move them too - otherwise the duplicate is protected and cannot go."""
+		from sales.models import Sale, SaleReceipt, SaleReturn, SaleReturnItem
+
+		receipt = SaleReceipt.objects.create(branch=self.main)
+		sale = Sale.objects.create(
+			receipt=receipt, product=self.duplicate, quantity=2,
+			price_sold_at=Decimal("500.00"),
+		)
+		entry_return = SaleReturn.objects.create(
+			receipt=receipt, branch=self.main, value=Decimal("500.00")
+		)
+		returned = SaleReturnItem.objects.create(
+			sale_return=entry_return, sale=sale, product=self.duplicate, quantity=1
+		)
+
+		response = self.client.post(
+			reverse("product-merge", args=[self.duplicate.pk]),
+			{"target": str(self.kept.pk)},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200, response.data)
+		self.assertEqual(response.data["returns_moved"], 1)
+		self.assertFalse(Product.objects.filter(pk=self.duplicate.pk).exists())
+		returned.refresh_from_db()
+		self.assertEqual(returned.product_id, self.kept.pk)
+
 	def test_manager_cannot_merge_products(self):
 		client = APIClient()
 		client.force_authenticate(self.manager)

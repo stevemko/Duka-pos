@@ -243,6 +243,15 @@ export const receiptsApi = {
   addPayment: (id, data) =>
     client.post(`/receipts/${id}/payments/`, data).then((res) => res.data),
 
+  // Goods a customer brought back. The key matters more here than at checkout:
+  // a lost answer must not hand over the refund twice.
+  addReturn: (id, data, idempotencyKey) =>
+    client
+      .post(`/receipts/${id}/returns/`, data, {
+        headers: idempotencyKey ? { "Idempotency-Key": idempotencyKey } : undefined,
+      })
+      .then((res) => res.data),
+
   get: (id) => client.get(`/receipts/${id}/`).then((res) => res.data),
 
   credits: (params) =>

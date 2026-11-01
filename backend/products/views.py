@@ -20,6 +20,7 @@ from accounts.services import (
     sees_all_branches,
     user_branch,
 )
+from sales.models import SaleReturnItem
 
 from .models import Product
 from .permissions import IsStaffOrReadOnly
@@ -164,6 +165,10 @@ class ProductViewSet(viewsets.ModelViewSet):
             }
             source, target = locked[source.pk], locked[target.pk]
             sales_moved = source.sales.update(product=target)
+            # Goods the shop already took back are part of the same shelf item's
+            # history, so they move with the sales. Left behind, they would protect
+            # the duplicate row and the merge could not finish.
+            returns_moved = SaleReturnItem.objects.filter(product=source).update(product=target)
             stock_moved = source.stock_quantity
             if stock_moved:
                 move_stock(target, stock_moved)
@@ -175,6 +180,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             "merged_name": source.name,
             "into": ProductSerializer(target, context={"request": request}).data,
             "sales_moved": sales_moved,
+            "returns_moved": returns_moved,
             "stock_moved": stock_moved,
         }
         if (source.cost_price, source.selling_price) != (target.cost_price, target.selling_price):

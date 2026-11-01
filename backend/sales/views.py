@@ -26,7 +26,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from accounts.models import Branch
-from accounts.permissions import IsSuperUser
+from accounts.permissions import IsManager, IsSuperUser
 from accounts.services import (
     branch_queryset,
     main_branch,
@@ -42,7 +42,14 @@ from products.models import Product
 from products.services import move_stock
 
 from .credit import check_credit_limit, find_customer
-from .models import Payment, Sale, SaleReceipt, stk_pending_cutoff
+from .models import (
+    Payment,
+    Sale,
+    SaleReceipt,
+    SaleReturn,
+    SaleReturnItem,
+    stk_pending_cutoff,
+)
 from .mpesa import (
     MpesaError,
     MpesaUnconfirmed,
@@ -54,6 +61,7 @@ from .mpesa import (
 from .serializers import (
     CheckoutSerializer,
     ReceiptPaymentSerializer,
+    ReturnCreateSerializer,
     SaleReceiptSerializer,
     SaleSerializer,
     StkPushSerializer,
@@ -69,8 +77,8 @@ def _share(amount, total):
 
 
 def _receipt_queryset():
-    return SaleReceipt.objects.select_related("branch", "created_by").prefetch_related(
-        "items__product", "payments__created_by"
+    return SaleReceipt.objects.select_related("branch", "created_by", "customer").prefetch_related(
+        "items__product", "payments__created_by", "returns__items__product"
     ).with_totals()
 
 
@@ -213,11 +221,24 @@ class SaleViewSet(viewsets.ModelViewSet):
             gross_profit=Sum("profit"),
             items_sold=Sum("quantity"),
         )
+        # What left the shelf today is not necessarily what was kept: goods handed
+        # straight back, and the cash refunded for them, belong in the same day's
+        # figures or the takings will not add up at close.
+        returns_today = branch_queryset(
+            SaleReturn.objects.filter(created_at__date=today), branch
+        )
+        value_back = returns_today.aggregate(total=Sum("value"))["total"] or Decimal("0.00")
+        refund_back = returns_today.aggregate(total=Sum("refund"))["total"] or Decimal("0.00")
+        items_back = SaleReturnItem.objects.filter(sale_return__in=returns_today).aggregate(
+            quantity=Sum("quantity"), profit=Sum("profit")
+        )
         return Response({
             "date": today,
-            "total_sales": totals["total_sales"] or 0,
-            "gross_profit": totals["gross_profit"] or 0,
-            "items_sold": totals["items_sold"] or 0,
+            "total_sales": (totals["total_sales"] or 0) - value_back,
+            "gross_profit": (totals["gross_profit"] or 0) - (items_back["profit"] or 0),
+            "items_sold": (totals["items_sold"] or 0) - (items_back["quantity"] or 0),
+            "returned_value": value_back,
+            "amount_refunded": refund_back,
         })
 
     @action(detail=False, methods=["get"], url_path="analytics")
@@ -281,6 +302,64 @@ class SaleViewSet(viewsets.ModelViewSet):
         expense_totals = monthly_expenses.aggregate(total_expenses=Sum("amount"))
         daily_expense_rows = monthly_expenses.values("date").annotate(amount_spent=Sum("amount"))
 
+        # What came back this month, counted on the day it was taken back. A refund
+        # paid today belongs in today's takings even when the goods sold last month,
+        # because that is the day the cash left the till.
+        monthly_returns = branch_queryset(
+            SaleReturn.objects.filter(
+                created_at__date__gte=month_start, created_at__date__lt=next_month
+            ),
+            branch,
+        )
+        monthly_return_items = SaleReturnItem.objects.filter(sale_return__in=monthly_returns)
+        returned_value = monthly_returns.aggregate(total=Sum("value"))["total"] or Decimal("0.00")
+        refunded_total = monthly_returns.aggregate(total=Sum("refund"))["total"] or Decimal("0.00")
+        items_back = monthly_return_items.aggregate(
+            quantity=Sum("quantity"), profit=Sum("profit")
+        )
+        returned_quantity = items_back["quantity"] or 0
+        returned_profit = items_back["profit"] or Decimal("0.00")
+
+        daily_returned = {}
+        for row in (
+            monthly_returns.annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(value_back=Sum("value"), refund_back=Sum("refund"))
+        ):
+            daily_returned[row["day"].isoformat()] = {
+                "value": row["value_back"] or Decimal("0.00"),
+                "refund": row["refund_back"] or Decimal("0.00"),
+                "quantity": 0,
+                "profit": Decimal("0.00"),
+            }
+        for row in (
+            monthly_return_items.annotate(day=TruncDate("sale_return__created_at"))
+            .values("day")
+            .annotate(quantity_back=Sum("quantity"), profit_back=Sum("profit"))
+        ):
+            slot = daily_returned.setdefault(
+                row["day"].isoformat(),
+                {"value": Decimal("0.00"), "refund": Decimal("0.00"),
+                 "quantity": 0, "profit": Decimal("0.00")},
+            )
+            slot["quantity"] = row["quantity_back"] or 0
+            slot["profit"] = row["profit_back"] or Decimal("0.00")
+
+        per_product_back = {
+            row["product_id"]: row
+            for row in monthly_return_items.values("product_id").annotate(
+                quantity_back=Sum("quantity"),
+                value_back=Sum("total"),
+                profit_back=Sum("profit"),
+            )
+        }
+        per_category_back = {
+            row["product__category"]: row
+            for row in monthly_return_items.values("product__category").annotate(
+                value_back=Sum("total"), quantity_back=Sum("quantity")
+            )
+        }
+
         def empty_day(day):
             return {
                 "date": day,
@@ -289,6 +368,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                 "items_sold": 0,
                 "amount_collected": Decimal("0.00"),
                 "amount_spent": Decimal("0.00"),
+                "amount_returned": Decimal("0.00"),
             }
 
         daily = {}
@@ -301,6 +381,7 @@ class SaleViewSet(viewsets.ModelViewSet):
                 "items_sold": row["items_sold"] or 0,
                 "amount_collected": Decimal("0.00"),
                 "amount_spent": Decimal("0.00"),
+                "amount_returned": Decimal("0.00"),
             }
         for row in daily_collections:
             day = row["day"].isoformat()
@@ -312,14 +393,27 @@ class SaleViewSet(viewsets.ModelViewSet):
             daily.setdefault(day, empty_day(day))["amount_spent"] = (
                 row["amount_spent"] or Decimal("0.00")
             )
+        for day, back in daily_returned.items():
+            entry = daily.setdefault(day, empty_day(day))
+            entry["total_sales"] -= back["value"]
+            entry["items_sold"] -= back["quantity"]
+            entry["gross_profit"] -= back["profit"]
+            entry["amount_collected"] -= back["refund"]
+            entry["amount_returned"] = back["refund"]
 
         product_performance = [
             {
                 "product_id": row["product_id"],
                 "product_name": row["product__name"],
-                "quantity_sold": row["quantity_sold"] or 0,
-                "sales_total": row["sales_total"] or Decimal("0.00"),
-                "gross_profit": row.get("gross_profit") or Decimal("0.00"),
+                "quantity_sold": (row["quantity_sold"] or 0) - (
+                    per_product_back.get(row["product_id"], {}).get("quantity_back") or 0
+                ),
+                "sales_total": (row["sales_total"] or Decimal("0.00")) - (
+                    per_product_back.get(row["product_id"], {}).get("value_back") or Decimal("0.00")
+                ),
+                "gross_profit": (row.get("gross_profit") or Decimal("0.00")) - (
+                    per_product_back.get(row["product_id"], {}).get("profit_back") or Decimal("0.00")
+                ),
             }
             for row in monthly_sales.values("product_id", "product__name")
             .annotate(**sold_aggregates)
@@ -338,9 +432,18 @@ class SaleViewSet(viewsets.ModelViewSet):
             .annotate(sales_total=Sum("total"), quantity_sold=Sum("quantity"))
             .order_by("-sales_total")
         )
+        for row in category_rows:
+            back = per_category_back.get(row["product__category"], {})
+            row["sales_total"] = (row["sales_total"] or Decimal("0.00")) - (
+                back.get("value_back") or Decimal("0.00")
+            )
+            row["quantity_sold"] = (row["quantity_sold"] or 0) - (
+                back.get("quantity_back") or 0
+            )
         category_total = sum(
             (row["sales_total"] or Decimal("0.00") for row in category_rows), Decimal("0.00")
         )
+        category_rows.sort(key=lambda row: row["sales_total"], reverse=True)
         sales_by_category = [
             {
                 "category": row["product__category"] or "Uncategorised",
@@ -408,15 +511,39 @@ class SaleViewSet(viewsets.ModelViewSet):
                 amount_collected=Sum("amount"),
             )
         }
+        weekly_return_rows = branch_queryset(
+            SaleReturn.objects.filter(created_at__date__gte=week_start), branch
+        )
+        weekly_returns = {
+            row["week"].date().isoformat(): row
+            for row in weekly_return_rows.annotate(week=TruncWeek("created_at"))
+            .values("week").annotate(value_back=Sum("value"), refund_back=Sum("refund"))
+        }
+        weekly_items_back = {
+            row["week"].date().isoformat(): row
+            for row in SaleReturnItem.objects.filter(sale_return__in=weekly_return_rows)
+            .annotate(week=TruncWeek("sale_return__created_at")).values("week").annotate(
+                quantity_back=Sum("quantity"), profit_back=Sum("profit")
+            )
+        }
         weekly_income = []
         for offset in range(7, -1, -1):
             week = current_week - timedelta(days=offset * 7)
             sales_row = weekly_sales.get(week.isoformat(), {})
+            back_row = weekly_returns.get(week.isoformat(), {})
+            items_row = weekly_items_back.get(week.isoformat(), {})
+            collected = weekly_collections.get(week.isoformat(), Decimal("0.00"))
+            refunded = back_row.get("refund_back") or Decimal("0.00")
             weekly_income.append({
                 "week_start": week.isoformat(),
-                "sales_total": sales_row.get("sales_total", Decimal("0.00")),
-                "gross_profit": sales_row.get("gross_profit", Decimal("0.00")),
-                "amount_collected": weekly_collections.get(week.isoformat(), Decimal("0.00")),
+                "sales_total": (
+                    sales_row.get("sales_total") or Decimal("0.00")
+                ) - (back_row.get("value_back") or Decimal("0.00")),
+                "gross_profit": (
+                    sales_row.get("gross_profit") or Decimal("0.00")
+                ) - (items_row.get("profit_back") or Decimal("0.00")),
+                "amount_collected": collected - refunded,
+                "amount_refunded": refunded,
             })
 
         gross_profit = totals.get("gross_profit") or Decimal("0.00")
@@ -425,11 +552,15 @@ class SaleViewSet(viewsets.ModelViewSet):
             # The shop's clock decides which day is "today" on the dashboard: a
             # till machine set to another zone would otherwise read the wrong row.
             "today": timezone.localdate().isoformat(),
-            "total_sales": totals["total_sales"] or Decimal("0.00"),
-            "gross_profit": gross_profit if is_manager else None,
+            # Everything below is net of what came back, so the month the dashboard
+            # shows is the month the shop actually kept.
+            "total_sales": (totals["total_sales"] or Decimal("0.00")) - returned_value,
+            "returned_value": returned_value,
+            "refunded_total": refunded_total,
+            "gross_profit": (gross_profit - returned_profit) if is_manager else None,
             "total_expenses": expense_total if is_manager else None,
-            "net_profit": (gross_profit - expense_total) if is_manager else None,
-            "items_sold": totals["items_sold"] or 0,
+            "net_profit": (gross_profit - returned_profit - expense_total) if is_manager else None,
+            "items_sold": (totals["items_sold"] or 0) - returned_quantity,
             "top_product": product_performance[0] if product_performance else None,
             "daily_totals": sorted(daily.values(), key=lambda row: row["date"]),
             "weekly_income": weekly_income,
@@ -653,24 +784,25 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
         status_filter = params.get("status")
         # Mirrors SaleReceipt.payment_status so a tab count and the badge on the row
         # can never disagree: settled bills are paid even with a prompt still open.
+        # The net, not the billed total - goods that came back are no longer owed.
         if status_filter == "paid":
-            queryset = queryset.filter(annotated_amount_paid__gte=F("annotated_total"))
+            queryset = queryset.filter(annotated_amount_paid__gte=F("annotated_net_total"))
         elif status_filter == "partially_paid":
             queryset = queryset.filter(
                 annotated_pending_count=0,
                 annotated_amount_paid__gt=0,
-                annotated_amount_paid__lt=F("annotated_total"),
+                annotated_amount_paid__lt=F("annotated_net_total"),
             )
         elif status_filter == "on_credit":
             queryset = queryset.filter(
                 annotated_pending_count=0,
                 annotated_amount_paid=0,
-                annotated_total__gt=0,
+                annotated_net_total__gt=0,
             )
         elif status_filter == "payment_pending":
             queryset = queryset.filter(
                 annotated_pending_count__gt=0,
-                annotated_amount_paid__lt=F("annotated_total"),
+                annotated_amount_paid__lt=F("annotated_net_total"),
             )
         elif status_filter:
             raise ValidationError({"status": "Use paid, partially_paid, on_credit or payment_pending."})
@@ -683,11 +815,18 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
         response["Content-Disposition"] = f'attachment; filename="transactions-{today}.csv"'
         response.write("\ufeff")
         writer = csv.writer(response)
+
+        # Sums come out of the database without the trailing zeros a column of
+        # takings is expected to line up on.
+        def money(value):
+            return f"{Decimal(value or 0):.2f}"
+
         writer.writerow([
             "Date", "Receipt", "Customer", "Phone", "Branch", "Served by",
-            "Items", "Total (KES)", "Paid (KES)", "Balance (KES)", "Status", "Payment methods",
+            "Items", "Total (KES)", "Returned (KES)", "Paid (KES)", "Refunded (KES)",
+            "Collected (KES)", "Balance (KES)", "Status", "Payment methods",
         ])
-        for receipt in self.get_queryset().prefetch_related("items", "payments"):
+        for receipt in self.get_queryset().prefetch_related("items", "payments", "returns"):
             methods = ", ".join(
                 sorted({payment.get_method_display() for payment in receipt.payments.all()})
             )
@@ -700,9 +839,14 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
                 (receipt.created_by.get_full_name() or receipt.created_by.get_username())
                 if receipt.created_by else "",
                 receipt.items.count(),
-                receipt.total,
-                receipt.amount_paid,
-                receipt.balance,
+                money(receipt.total),
+                money(receipt.returned_total),
+                money(receipt.amount_paid),
+                # The drawer only ever held the difference: cash that went back with
+                # the goods never stayed in it.
+                money(receipt.refunded_total),
+                money(receipt.amount_paid - receipt.refunded_total),
+                money(receipt.balance),
                 receipt.payment_status.replace("_", " "),
                 methods,
             ])
@@ -711,8 +855,8 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=["get"], url_path="credits")
     def credits(self, request):
         receipts = self.get_queryset().filter(
-            annotated_total__gt=0,
-            annotated_amount_paid__lt=F("annotated_total"),
+            annotated_net_total__gt=0,
+            annotated_amount_paid__lt=F("annotated_net_total"),
         )
         credit_records = []
         customer_keys = set()
@@ -771,7 +915,7 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
         # debt nobody is looking at, and closing a period must never lose money.
         owing_ids = list(
             queryset.filter(closed_at__isnull=True, **window)
-            .filter(annotated_amount_paid__lt=F("annotated_total"))
+            .filter(annotated_amount_paid__lt=F("annotated_net_total"))
             .values_list("id", flat=True)
         )
         settled_count = queryset.filter(closed_at__isnull=True, **window).exclude(
@@ -965,6 +1109,158 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
                 created_by=request.user if request.user.is_authenticated else None,
                 **payment_data,
             )
+
+        receipt = _receipt_queryset().get(pk=pk)
+        return Response(SaleReceiptSerializer(receipt).data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="returns",
+        permission_classes=[IsAuthenticated, IsManager],
+        throttle_classes=[PaymentThrottle],
+    )
+    def returns(self, request, pk=None):
+        """Take goods back off the customer and put the money right beside them.
+
+        Nothing on the original bill is touched. A return row says what came back and
+        what was handed over for it, the shelf is topped up in the same write, and
+        every figure the counter reads afterwards - balance, credit book, today's
+        takings - is worked out from both rows.
+        """
+        return_serializer = ReturnCreateSerializer(data=request.data)
+        return_serializer.is_valid(raise_exception=True)
+        data = return_serializer.validated_data
+
+        idempotency_key = (
+            request.headers.get("Idempotency-Key")
+            or data.get("idempotency_key")
+            or ""
+        ).strip()
+        if len(idempotency_key) > 64:
+            raise ValidationError({"idempotency_key": "Use 64 characters or fewer."})
+        fingerprint = _request_fingerprint(request.data)
+
+        def replay():
+            existing = SaleReturn.objects.prefetch_related(
+                "items__product", "receipt"
+            ).filter(idempotency_key=idempotency_key).first()
+            if not existing:
+                return None
+            if existing.idempotency_hash and existing.idempotency_hash != fingerprint:
+                raise IdempotencyConflict()
+            return Response(
+                SaleReceiptSerializer(_receipt_queryset().get(pk=existing.receipt_id)).data,
+                status=status.HTTP_200_OK,
+            )
+
+        if idempotency_key:
+            answered = replay()
+            if answered:
+                return answered
+
+        try:
+            with transaction.atomic():
+                receipt = SaleReceipt.objects.select_for_update().get(pk=pk)
+                _assert_receipt_access(request.user, receipt)
+                if receipt.closed_at:
+                    raise ValidationError({
+                        "receipt": "This bill is in a closed period. Reopen the period "
+                                   "before taking goods back against it."
+                    })
+                if receipt.payments.filter(
+                    status=Payment.Status.PENDING,
+                    created_at__gte=stk_pending_cutoff(),
+                ).exists():
+                    # The customer may still be about to pay the whole old total. A
+                    # return taken underneath that prompt would let money arrive for
+                    # goods that already came back, with nothing to hand it over for.
+                    raise ValidationError({
+                        "receipt": "An M-Pesa request on this bill is still waiting for "
+                                   "the customer's PIN. Let it finish or fail first, then "
+                                   "take the goods back."
+                    })
+
+                lines = {sale.id: sale for sale in Sale.objects.filter(receipt=receipt).select_related("product")}
+                if not lines:
+                    raise ValidationError({"items": "This receipt has no lines to return."})
+
+                asked = {}
+                for item in data["items"]:
+                    sale_id = item["sale"].id
+                    if sale_id not in lines:
+                        raise ValidationError({
+                            "items": ["That line was not sold on this receipt."]
+                        })
+                    asked[sale_id] = asked.get(sale_id, 0) + item["quantity"]
+
+                still_out = {}
+                for row in (
+                    SaleReturnItem.objects.filter(sale_id__in=asked)
+                    .values("sale_id")
+                    .annotate(came_back=Sum("quantity"))
+                ):
+                    still_out[row["sale_id"]] = row["came_back"] or 0
+
+                value = Decimal("0.00")
+                chosen = []
+                for sale_id, quantity in asked.items():
+                    sale = lines[sale_id]
+                    returnable = sale.quantity - still_out.get(sale_id, 0)
+                    if quantity > returnable:
+                        raise ValidationError({
+                            "items": [
+                                f"Only {returnable} of the {sale.quantity} "
+                                f"{sale.product.name} on this bill are still out."
+                            ]
+                        })
+                    value += sale.price_sold_at * quantity
+                    chosen.append((sale, quantity))
+
+                # What the customer now owes, against what they actually handed in.
+                # Anything left over is the shop's money in the wrong hand, and the
+                # number is worked out here so it cannot be typed in at the till.
+                owed_after = (
+                    receipt.total - receipt.returned_total - value
+                )
+                refund = receipt.amount_paid - receipt.refunded_total - owed_after
+                if refund < 0:
+                    refund = Decimal("0.00")
+                method = data.get("refund_method") or ""
+                if refund > 0 and not method:
+                    # A refund nobody described is still cash that left the till.
+                    method = Payment.Method.CASH
+
+                entry_return = SaleReturn.objects.create(
+                    receipt=receipt,
+                    branch=receipt.branch,
+                    created_by=request.user if request.user.is_authenticated else None,
+                    value=value,
+                    refund=refund,
+                    method=method,
+                    reference=(data.get("reference") or "").strip(),
+                    reason=(data.get("reason") or "").strip(),
+                    idempotency_key=idempotency_key or None,
+                    idempotency_hash=fingerprint if idempotency_key else "",
+                )
+                for sale, quantity in chosen:
+                    SaleReturnItem.objects.create(
+                        sale_return=entry_return,
+                        sale=sale,
+                        product=sale.product,
+                        quantity=quantity,
+                    )
+                    if move_stock(sale.product, quantity) is None:
+                        raise ValidationError({
+                            "items": [f"{sale.product.name} is no longer stocked, "
+                                      "so these goods cannot go back on the shelf."]
+                        })
+        except IntegrityError:
+            if idempotency_key:
+                answered = replay()
+                if answered:
+                    return answered
+            raise
 
         receipt = _receipt_queryset().get(pk=pk)
         return Response(SaleReceiptSerializer(receipt).data, status=status.HTTP_201_CREATED)

@@ -13,7 +13,15 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from products.models import Product
-from .models import Customer, Payment, Sale, SaleReceipt, normalize_customer_phone
+from .models import (
+    Customer,
+    Payment,
+    Sale,
+    SaleReceipt,
+    SaleReturn,
+    SaleReturnItem,
+    normalize_customer_phone,
+)
 from .mpesa import MpesaError, MpesaUnconfirmed, initiate_stk_push
 
 
@@ -1824,3 +1832,260 @@ class ClosePeriodTests(TestCase):
 		self.assertEqual(
 			self.client.get(reverse("receipt-list"), {"include_closed": "1"}).data["count"], 0
 		)
+
+
+class ReturnTests(TestCase):
+	def setUp(self):
+		from accounts.services import main_branch
+
+		self.client = APIClient()
+		self.cashier = get_user_model().objects.create_user(
+			username="till", password="return-pass"
+		)
+		self.owner = get_user_model().objects.create_user(
+			username="owner", password="return-pass", is_superuser=True, is_staff=True
+		)
+		self.client.force_authenticate(user=self.owner)
+		self.rice = Product.objects.create(
+			name="Rice",
+			sku="RETURN-1",
+			cost_price="100.00",
+			selling_price="125.00",
+			stock_quantity=40,
+		)
+		self.customer = Customer.objects.create(
+			name="Amina", phone="0794671494", branch=main_branch()
+		)
+
+	def _bill(self, quantity=3, paid="375.00", name="Amina", phone="0794671494"):
+		body = {
+			"customer_name": name,
+			"customer_phone": phone,
+			"items": [
+				{"product": str(self.rice.id), "quantity": quantity, "price_sold_at": "125.00"}
+			],
+		}
+		if paid:
+			body["payments"] = [{"amount": paid, "method": "cash"}]
+		created = self.client.post(reverse("sale-checkout"), body, format="json")
+		self.assertEqual(created.status_code, 201, created.data)
+		return created.data["id"]
+
+	def _return(self, receipt, quantity, key="", **body):
+		sale = Sale.objects.filter(receipt_id=receipt).first()
+		return self.client.post(
+			reverse("receipt-returns", kwargs={"pk": receipt}),
+			{"items": [{"sale": str(sale.id), "quantity": quantity}], **body},
+			format="json",
+			**({"HTTP_IDEMPOTENCY_KEY": key} if key else {}),
+		)
+
+	def test_a_return_puts_the_goods_back_and_the_money_over(self):
+		receipt = self._bill()
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 37)
+
+		taken = self._return(receipt, 1, reason="Customer changed their mind")
+		self.assertEqual(taken.status_code, 201, taken.data)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 38)
+
+		self.assertEqual(taken.data["total"], "375.00")
+		self.assertEqual(taken.data["returned_total"], "125.00")
+		self.assertEqual(taken.data["net_total"], "250.00")
+		self.assertEqual(taken.data["refunded_total"], "125.00")
+		self.assertEqual(taken.data["balance"], "0.00")
+		self.assertEqual(taken.data["payment_status"], "paid")
+		self.assertEqual(len(taken.data["returns"]), 1)
+		line = taken.data["returns"][0]["items"][0]
+		self.assertEqual(line["product_name"], "Rice")
+		self.assertEqual(line["unit_price"], "125.00")
+
+	def test_the_sale_line_is_never_rewritten(self):
+		receipt = self._bill()
+		before = Sale.objects.get(receipt_id=receipt)
+		self._return(receipt, 2)
+
+		after = Sale.objects.get(pk=before.pk)
+		self.assertEqual(after.quantity, 3)
+		self.assertEqual(after.total, Decimal("375.00"))
+		self.assertEqual(Sale.objects.filter(receipt_id=receipt).count(), 1)
+		with self.assertRaises(ValidationError):
+			after.delete()
+		with self.assertRaises(ValidationError):
+			SaleReturnItem.objects.get(sale_return=SaleReturn.objects.get(receipt_id=receipt)).delete()
+
+	def test_the_refund_is_worked_out_not_typed_in(self):
+		receipt = self._bill(paid="375.00")
+		# A till that tries to hand back more than the shop holds is overruled:
+		# the number comes from what was paid against what is now owed.
+		taken = self._return(receipt, 1, refund="9999.00")
+		self.assertEqual(taken.data["refunded_total"], "125.00")
+
+	def test_a_return_on_a_credit_bill_clears_the_debt_without_any_cash(self):
+		receipt = self._bill(paid="100.00")
+		taken = self._return(receipt, 1)
+		self.assertEqual(taken.status_code, 201, taken.data)
+		self.assertEqual(taken.data["net_total"], "250.00")
+		self.assertEqual(taken.data["refunded_total"], "0.00")
+		self.assertEqual(taken.data["balance"], "150.00")
+		self.assertEqual(taken.data["payment_status"], "partially_paid")
+		self.customer.refresh_from_db()
+		self.assertEqual(self.customer.outstanding, Decimal("150.00"))
+
+	def test_nothing_can_come_back_that_is_not_still_out(self):
+		receipt = self._bill(quantity=2, paid="250.00")
+		first = self._return(receipt, 1)
+		self.assertEqual(first.status_code, 201, first.data)
+
+		too_many = self._return(receipt, 2)
+		self.assertEqual(too_many.status_code, 400)
+		self.assertIn("items", too_many.data)
+		self.assertEqual(SaleReturn.objects.filter(receipt_id=receipt).count(), 1)
+
+	def test_a_line_from_another_bill_cannot_be_returned_here(self):
+		receipt = self._bill()
+		other_line = Sale.objects.get(receipt_id=self._bill(phone="0700000111"))
+		refused = self.client.post(
+			reverse("receipt-returns", kwargs={"pk": receipt}),
+			{"items": [{"sale": str(other_line.id), "quantity": 1}]},
+			format="json",
+		)
+		self.assertEqual(refused.status_code, 400)
+		self.assertEqual(SaleReturn.objects.count(), 0)
+
+	def test_only_a_manager_can_take_a_return(self):
+		receipt = self._bill()
+		self.client.force_authenticate(user=self.cashier)
+		refused = self._return(receipt, 1)
+		self.assertEqual(refused.status_code, 403)
+		self.assertEqual(SaleReturn.objects.count(), 0)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 37)
+
+	def test_a_return_is_written_once_even_if_the_answer_is_lost(self):
+		receipt = self._bill()
+		first = self._return(receipt, 1, key="return-abc")
+		self.assertEqual(first.status_code, 201, first.data)
+
+		retry = self._return(receipt, 1, key="return-abc")
+		self.assertEqual(retry.status_code, 200, retry.data)
+		self.assertEqual(SaleReturn.objects.filter(receipt_id=receipt).count(), 1)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 38)
+
+		clash = self._return(receipt, 2, key="return-abc")
+		self.assertEqual(clash.status_code, 409)
+
+	def test_a_closed_period_cannot_be_edited_by_a_return(self):
+		receipt = self._bill()
+		# The archive is paperwork the owner has already signed off on, so a return
+		# cannot quietly move its numbers.
+		SaleReceipt.objects.filter(pk=receipt).update(
+			closed_at=timezone.now(), closed_by=self.owner
+		)
+		refused = self._return(receipt, 1)
+		self.assertEqual(refused.status_code, 400)
+		self.assertEqual(SaleReturn.objects.count(), 0)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 37)
+
+	def test_a_refund_leaves_a_different_bill_still_owed(self):
+		# Two bills on one account: one paid up, one still on credit. Handing cash
+		# back on the paid-up bill must not quietly clear what the other still owes.
+		settled = self._bill(quantity=2, paid="250.00")
+		self._bill(quantity=3, paid="25.00")
+
+		taken = self._return(settled, 1)
+		self.assertEqual(taken.data["refunded_total"], "125.00")
+
+		book = self.client.get(
+			reverse("customer-ledger", kwargs={"pk": self.customer.id})
+		).data
+		self.assertEqual(book["customer"]["outstanding"], "350.00")
+		returned = next(entry for entry in book["entries"] if entry["type"] == "return")
+		self.assertEqual(returned["credit"], Decimal("0.00"))
+		self.assertIn("125.00 handed back", returned["description"])
+		self.assertEqual(book["entries"][-1]["balance"], Decimal("350.00"))
+
+	def test_the_export_shows_what_stayed_in_the_till(self):
+		receipt = self._bill()
+		self._return(receipt, 1)
+
+		body = self.client.get(reverse("receipt-export")).content.decode("utf-8-sig")
+		self.assertIn("Collected (KES)", body)
+		# Billed 375, 125 came back, 375 was paid and 125 handed over: the drawer
+		# kept 250, and that is the figure the owner has to be able to count.
+		self.assertIn("375.00,125.00,375.00,125.00,250.00,0.00", body)
+
+	def test_a_return_waits_for_an_unanswered_mpesa_prompt(self):
+		# Money still on its way in answers to the old total. Taking goods back
+		# underneath that prompt would let the payment land against goods the
+		# shop already has, so the counter is told to wait.
+		receipt = self._bill(paid="125.00")
+		Payment.objects.create(
+			receipt_id=receipt,
+			created_by=self.owner,
+			amount=Decimal("250.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.PENDING,
+		)
+
+		refused = self._return(receipt, 1)
+		self.assertEqual(refused.status_code, 400)
+		self.assertIn("M-Pesa", str(refused.data))
+		self.assertEqual(SaleReturn.objects.count(), 0)
+		self.rice.refresh_from_db()
+		self.assertEqual(self.rice.stock_quantity, 37)
+
+	def test_the_ledger_shows_what_came_back(self):
+		receipt = self._bill(paid="100.00")
+		self._return(receipt, 1, reason="Damaged")
+
+		entries = self.client.get(
+			reverse("customer-ledger", kwargs={"pk": self.customer.id})
+		).data["entries"]
+		returned = next(entry for entry in entries if entry["type"] == "return")
+		self.assertEqual(returned["credit"], Decimal("125.00"))
+		self.assertIn("Damaged", returned["description"])
+		self.assertEqual(entries[-1]["balance"], Decimal("150.00"))
+
+	def test_the_day_takings_lose_what_was_handed_back(self):
+		receipt = self._bill()
+		self._return(receipt, 1)
+
+		summary = self.client.get(reverse("sale-summary")).data
+		self.assertEqual(summary["total_sales"], Decimal("250.00"))
+		self.assertEqual(summary["items_sold"], 2)
+		self.assertEqual(summary["gross_profit"], Decimal("50.00"))
+		self.assertEqual(summary["amount_refunded"], Decimal("125.00"))
+
+		month = timezone.localdate().strftime("%Y-%m")
+		analytics = self.client.get(reverse("sale-analytics"), {"month": month}).data
+		self.assertEqual(analytics["total_sales"], Decimal("250.00"))
+		self.assertEqual(analytics["returned_value"], Decimal("125.00"))
+		self.assertEqual(analytics["items_sold"], 2)
+		today_row = next(
+			row for row in analytics["daily_totals"]
+			if row["date"] == timezone.localdate().isoformat()
+		)
+		# Collected less refunded is what stayed in the till, which is the number
+		# the owner counts against the cash drawer at close.
+		self.assertEqual(today_row["amount_collected"], Decimal("250.00"))
+		product_row = next(
+			row for row in analytics["product_performance"] if row["product_id"] == self.rice.id
+		)
+		self.assertEqual(product_row["quantity_sold"], 2)
+		self.assertEqual(product_row["sales_total"], Decimal("250.00"))
+
+	def test_a_full_return_leaves_nothing_owed_and_no_second_debt(self):
+		receipt = self._bill(paid="375.00")
+		taken = self._return(receipt, 3)
+		self.assertEqual(taken.data["net_total"], "0.00")
+		self.assertEqual(taken.data["balance"], "0.00")
+		self.assertEqual(taken.data["payment_status"], "paid")
+		self.assertEqual(taken.data["refunded_total"], "375.00")
+
+		listed = self.client.get(reverse("receipt-list"), {"status": "paid"})
+		self.assertEqual(listed.data["count"], 1)
+		self.assertEqual(self.client.get(reverse("receipt-credits")).data["receipt_count"], 0)
