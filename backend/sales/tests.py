@@ -6,13 +6,14 @@ from urllib.error import HTTPError, URLError
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
+from django.db.models.deletion import ProtectedError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 from products.models import Product
-from .models import Payment, Sale, SaleReceipt
+from .models import Customer, Payment, Sale, SaleReceipt, normalize_customer_phone
 from .mpesa import MpesaError, MpesaUnconfirmed, initiate_stk_push
 
 
@@ -684,6 +685,272 @@ class IdempotentCheckoutTests(TestCase):
 
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(response.data["id"], str(legacy.id))
+
+
+class CustomerTestsBase:
+	def setUp(self):
+		self.client = APIClient()
+		self.cashier = get_user_model().objects.create_user(
+			username="till", password="credit-pass"
+		)
+		self.owner = get_user_model().objects.create_user(
+			username="owner", password="credit-pass", is_superuser=True, is_staff=True
+		)
+		self.client.force_authenticate(user=self.cashier)
+		self.bulb = Product.objects.create(
+			name="Bulb",
+			sku="CREDIT-1",
+			cost_price="100.00",
+			selling_price="200.00",
+			stock_quantity=20,
+		)
+		self.customers_url = reverse("customer-list")
+		self.checkout_url = reverse("sale-checkout")
+
+	def _add_customer(self, name="Amina Hassan", phone="0794671494", **extra):
+		return self.client.post(
+			self.customers_url, {"name": name, "phone": phone, **extra}, format="json"
+		)
+
+	def _credit_sale(self, units=1, customer=None, phone="", name="Amina"):
+		return self.client.post(
+			self.checkout_url,
+			{
+				"items": [
+					{"product": str(self.bulb.id), "quantity": units, "price_sold_at": "200.00"}
+				],
+				"payments": [],
+				"customer_name": name,
+				"customer_phone": phone,
+				**({"customer": str(customer)} if customer else {}),
+			},
+			format="json",
+		)
+
+class CustomerAccountTests(CustomerTestsBase, TestCase):
+	def test_a_credit_sale_sits_on_the_account_not_only_on_the_receipt(self):
+		created = self._add_customer()
+		self.assertEqual(created.status_code, 201)
+
+		sale = self._credit_sale(customer=created.data["id"])
+		self.assertEqual(sale.status_code, 201)
+		self.assertEqual(str(sale.data["customer"]), created.data["id"])
+
+		book = self.client.get(reverse("customer-ledger", args=[created.data["id"]]))
+		self.assertEqual(book.data["customer"]["outstanding"], "200.00")
+		self.assertEqual([entry["type"] for entry in book.data["entries"]], ["sale"])
+		self.assertEqual(book.data["entries"][0]["balance"], Decimal("200.00"))
+
+	def test_the_note_handed_in_at_the_till_is_counted_once_in_the_book(self):
+		# The part paid at the counter is both a payment on the receipt and a line
+		# of its own in the book. Reading it in both places would tell the shop the
+		# customer has paid twice over.
+		created = self._add_customer()
+		sale = self.client.post(
+			self.checkout_url,
+			{
+				"items": [
+					{"product": str(self.bulb.id), "quantity": 3, "price_sold_at": "200.00"}
+				],
+				"payments": [{"method": "cash", "amount": "200.00"}],
+				"customer_name": "Amina Hassan",
+				"customer": str(created.data["id"]),
+			},
+			format="json",
+		)
+		self.assertEqual(sale.status_code, 201)
+
+		book = self.client.get(reverse("customer-ledger", args=[created.data["id"]]))
+		self.assertEqual(
+			[entry["type"] for entry in book.data["entries"]], ["sale", "payment"]
+		)
+		self.assertEqual(book.data["entries"][-1]["balance"], Decimal("400.00"))
+		self.assertEqual(book.data["customer"]["outstanding"], "400.00")
+
+	def test_one_number_typed_two_ways_is_one_account(self):
+		created = self._add_customer(phone="0794671494")
+		# A second cashier types the same customer the way their phone shows it.
+		sale = self._credit_sale(phone="+254794671494", name="")
+		self.assertEqual(sale.status_code, 201)
+		self.assertEqual(str(sale.data["customer"]), created.data["id"])
+		self.assertEqual(Customer.objects.count(), 1)
+
+	def test_a_number_is_recognised_in_every_shape_the_shop_types_it(self):
+		for written in (
+			"0794671494",
+			"+254794671494",
+			"254794671494",
+			"0794 671 494",
+		):
+			self.assertEqual(normalize_customer_phone(written), "254794671494", written)
+		self.assertEqual(normalize_customer_phone("020 661 0000"), "")
+		self.assertEqual(normalize_customer_phone(""), "")
+
+	def test_an_account_the_shop_ever_sold_to_cannot_be_erased(self):
+		# PROTECT on the receipt link: a customer row is evidence of a debt, and a
+		# till must not be able to delete its way out of the ledger.
+		created = self._add_customer()
+		self._credit_sale(customer=created.data["id"])
+		with self.assertRaises(ProtectedError):
+			Customer.objects.get(pk=created.data["id"]).delete()
+
+
+class CreditLimitTests(CustomerTestsBase, TestCase):
+	def test_an_account_with_no_ceiling_is_never_blocked(self):
+		created = self._add_customer()
+		for _ in range(4):
+			self.assertEqual(
+				self._credit_sale(units=5, customer=created.data["id"]).status_code, 201
+			)
+		self.assertEqual(
+			Customer.objects.get(pk=created.data["id"]).outstanding, Decimal("4000.00")
+		)
+
+	def test_a_paid_bill_is_not_left_on_the_ledger(self):
+		# Money already in means the account is settled, however late it arrived: a
+		# receipt still open would keep the customer's debt alive forever.
+		created = self._add_customer()
+		sale = self._credit_sale(customer=created.data["id"])
+		self.client.post(
+			reverse("receipt-payments", args=[sale.data["id"]]),
+			{"amount": "200.00", "method": "cash"},
+			format="json",
+		)
+
+		self.assertEqual(
+			Customer.objects.get(pk=created.data["id"]).outstanding, Decimal("0.00")
+		)
+		response = self.client.get(reverse("customer-debtors"))
+		self.assertEqual(response.data["customer_count"], 0)
+
+	def test_a_ceiling_blocks_only_the_sale_that_crosses_it(self):
+		created = self._add_customer()
+		self.client.force_authenticate(user=self.owner)
+		self.assertEqual(
+			self.client.patch(
+				reverse("customer-detail", args=[created.data["id"]]),
+				{"credit_limit": "300.00"},
+				format="json",
+			).status_code,
+			200,
+		)
+		self.client.force_authenticate(user=self.cashier)
+
+		self.assertEqual(self._credit_sale(customer=created.data["id"]).status_code, 201)
+		blocked = self._credit_sale(customer=created.data["id"])
+		self.assertEqual(blocked.status_code, 400)
+		self.assertIn("credit", str(blocked.data["customer"][0]))
+
+		# Take part of it back and the same sale is allowed again.
+		paid = self.client.post(
+			reverse("customer-payments", args=[created.data["id"]]),
+			{"amount": "150.00", "method": "cash"},
+			format="json",
+		)
+		self.assertEqual(paid.status_code, 201)
+		self.assertEqual(paid.data["still_owing"], Decimal("50.00"))
+		self.assertEqual(self._credit_sale(customer=created.data["id"]).status_code, 201)
+
+
+class CustomerPaymentTests(CustomerTestsBase, TestCase):
+	def test_a_payment_clears_the_oldest_bill_first(self):
+		created = self._add_customer()
+		first = self._credit_sale(customer=created.data["id"])
+		second = self._credit_sale(customer=created.data["id"])
+		self.client.post(
+			reverse("customer-payments", args=[created.data["id"]]),
+			{"amount": "300.00", "method": "cash"},
+			format="json",
+		)
+
+		self.assertEqual(
+			SaleReceipt.objects.get(pk=first.data["id"]).payment_status, "paid"
+		)
+		self.assertEqual(
+			SaleReceipt.objects.get(pk=second.data["id"]).payment_status, "partially_paid"
+		)
+		self.assertEqual(
+			Customer.objects.get(pk=created.data["id"]).outstanding, Decimal("100.00")
+		)
+
+	def test_paying_more_than_the_account_owes_is_refused(self):
+		created = self._add_customer()
+		self._credit_sale(customer=created.data["id"])
+
+		response = self.client.post(
+			reverse("customer-payments", args=[created.data["id"]]),
+			{"amount": "500.00", "method": "cash"},
+			format="json",
+		)
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("owes 200.00", str(response.data["amount"][0]))
+		self.assertEqual(Payment.objects.filter(receipt__customer=created.data["id"]).count(), 0)
+
+class CustomerBookTests(CustomerTestsBase, TestCase):
+	def test_a_name_without_a_number_is_still_a_book(self):
+		# Plenty of regulars are only known by name. The number is how a sale finds
+		# its account on its own, but a name is a book the shop may keep.
+		created = self._add_customer(name="Mama Ntilie", phone="")
+		self.assertEqual(created.status_code, 201)
+
+		sale = self._credit_sale(customer=created.data["id"], name="Mama Ntilie")
+		self.assertEqual(sale.status_code, 201)
+		self.assertEqual(
+			Customer.objects.get(pk=created.data["id"]).outstanding, Decimal("200.00")
+		)
+
+	def test_a_sale_with_no_account_picked_opens_no_book(self):
+		# A walk-up on a till with nothing typed but a name is not a debtor: making
+		# one would fill the book with half-remembered names.
+		response = self._credit_sale(name="Walk-in")
+		self.assertEqual(response.status_code, 201)
+		self.assertIsNone(response.data["customer"])
+		self.assertEqual(Customer.objects.count(), 0)
+
+	def test_a_second_account_for_one_number_is_refused(self):
+		self._add_customer(name="Amina Hassan", phone="0794671494")
+		response = self._add_customer(name="Hassan Amina", phone="+254 794 671 494")
+		self.assertEqual(response.status_code, 400)
+		self.assertIn("Amina Hassan", str(response.data["phone"][0]))
+
+	def test_only_a_manager_moves_a_ceiling(self):
+		created = self._add_customer()
+		response = self.client.patch(
+			reverse("customer-detail", args=[created.data["id"]]),
+			{"credit_limit": "500.00"},
+			format="json",
+		)
+		self.assertEqual(response.status_code, 403)
+
+	def test_closing_an_account_keeps_the_money_owed_visible(self):
+		created = self._add_customer()
+		self._credit_sale(customer=created.data["id"])
+		self.client.force_authenticate(user=self.owner)
+
+		response = self.client.delete(reverse("customer-detail", args=[created.data["id"]]))
+		self.assertEqual(response.status_code, 200)
+		self.assertIn("closed for new credit", str(response.data["detail"]))
+		self.assertTrue(Customer.objects.filter(pk=created.data["id"], is_active=False).exists())
+		self.assertEqual(SaleReceipt.objects.filter(customer_id=created.data["id"]).count(), 1)
+
+		# Out of the till's picker, still readable in the book.
+		self.client.force_authenticate(user=self.cashier)
+		listed = self.client.get(self.customers_url)
+		self.assertEqual([row["id"] for row in listed.data["results"]], [])
+		book = self.client.get(reverse("customer-ledger", args=[created.data["id"]]))
+		self.assertEqual(book.data["customer"]["outstanding"], "200.00")
+
+	def test_the_debtors_page_adds_up_across_accounts(self):
+		first = self._add_customer(name="Amina", phone="0794671494")
+		second = self._add_customer(name="Otieno", phone="0700000001")
+		self._credit_sale(units=2, customer=first.data["id"], name="Amina")
+		self._credit_sale(units=1, customer=second.data["id"], name="Otieno")
+
+		response = self.client.get(reverse("customer-debtors"))
+		self.assertEqual(response.data["outstanding_total"], Decimal("600.00"))
+		self.assertEqual(
+			[row["name"] for row in response.data["customers"]], ["Amina", "Otieno"]
+		)
 
 
 class MpesaCallbackEdgeTests(TestCase):

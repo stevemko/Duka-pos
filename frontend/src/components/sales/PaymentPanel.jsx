@@ -27,6 +27,10 @@ export default function PaymentPanel({
   onCustomerNameChange,
   customerPhone,
   onCustomerPhoneChange,
+  accounts = [],
+  customerId = "",
+  onPickAccount,
+  onSaveAccount,
   onSubmit,
   loading,
   blocked,
@@ -43,6 +47,11 @@ export default function PaymentPanel({
       : 0;
   const paybill = shop?.paybill || "";
   const account = customerPhone.trim() || "GREENLIGHT";
+  const picked = accounts.find((row) => row.id === customerId) || null;
+  // The limit is the owner's, so the cashier sees it before the server refuses it.
+  const headroomCents = picked?.credit_headroom ? toCents(picked.credit_headroom) : null;
+  const overLimit =
+    headroomCents !== null && picked?.credit_limit && balanceCents > headroomCents;
 
   return (
     <Card className="p-4">
@@ -196,6 +205,57 @@ export default function PaymentPanel({
             />
           </Field>
         </div>
+
+        {accounts.length > 0 && (
+          <div className="space-y-1.5">
+            <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-ink-500">
+              On the credit book
+            </p>
+            <div className="space-y-1.5">
+              {accounts.slice(0, 4).map((row) => (
+                <button
+                  key={row.id}
+                  type="button"
+                  onClick={() => onPickAccount?.(row)}
+                  className={cn(
+                    "flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition",
+                    row.id === customerId
+                      ? "border-brand-500 bg-brand-50 text-ink-900"
+                      : "border-ink-200 hover:border-ink-300 hover:bg-ink-50",
+                  )}
+                >
+                  <span className="min-w-0 truncate font-semibold">{row.name}</span>
+                  <span className="shrink-0 text-xs tabular text-ink-600">
+                    {row.phone || "-"} · owes {money(row.outstanding)}
+                    {row.credit_limit ? ` / ${money(row.credit_limit)}` : ""}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {paymentMode !== "paid" &&
+          !customerId &&
+          // Offering a new account next to a name that is already on the book
+          // invites a duplicate the server would refuse anyway.
+          accounts.length === 0 &&
+          (customerName.trim() || customerPhone.trim()) && (
+          <button
+            type="button"
+            onClick={onSaveAccount}
+            className="text-xs font-semibold text-brand-700 underline underline-offset-2 hover:text-brand-800"
+          >
+            Open an account for {customerName.trim() || customerPhone.trim()} and keep this debt on it
+          </button>
+        )}
+
+        {overLimit && (
+          <p className="rounded-xl bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">
+            {picked.name} has {money(picked.credit_headroom)} of credit left. This sale goes past
+            their limit, so the till will refuse it until part of it is paid.
+          </p>
+        )}
 
         {paymentMode !== "paid" && (
           <div className="flex items-center justify-between rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800">

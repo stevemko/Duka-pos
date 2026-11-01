@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from .models import Payment, Sale, SaleReceipt
+from .models import Customer, Payment, Sale, SaleReceipt, normalize_customer_phone
 from products.models import Product
 
 
@@ -66,7 +66,7 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
     class Meta:
         model = SaleReceipt
         fields = [
-            "id", "branch", "branch_name", "created_by_name", "customer_name",
+            "id", "branch", "branch_name", "created_by_name", "customer", "customer_name",
             "customer_phone", "items", "payments", "total", "amount_paid", "balance",
             "payment_status", "created_at",
         ]
@@ -78,6 +78,91 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
         if not receipt.created_by:
             return ""
         return receipt.created_by.get_full_name() or receipt.created_by.get_username()
+
+
+class CustomerSerializer(serializers.ModelSerializer):
+    """A credit account. The shop sets the ceiling; the receipts set the debt.
+
+    A customer's name and number are typed at the counter, so the two are checked
+    here rather than at the database: a duplicate ledger is worse than a typo,
+    because the debt then sits on the wrong person.
+    """
+
+    outstanding = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    credit_headroom = serializers.DecimalField(
+        max_digits=12, decimal_places=2, read_only=True, allow_null=True
+    )
+    branch_name = serializers.SerializerMethodField()
+    last_purchase = serializers.SerializerMethodField()
+    receipt_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Customer
+        fields = [
+            "id", "branch", "branch_name", "name", "phone", "credit_limit",
+            "credit_headroom", "notes", "is_active", "outstanding", "last_purchase",
+            "receipt_count", "created_at",
+        ]
+        # branch comes from the logged-in user's shop, never from the form.
+        read_only_fields = [
+            "id", "branch", "outstanding", "credit_headroom", "last_purchase",
+            "receipt_count", "created_at",
+        ]
+
+    def get_branch_name(self, customer):
+        return customer.branch.name if customer.branch else "Main shop"
+
+    def get_last_purchase(self, customer):
+        # Set by the list query; a freshly saved row has no annotation to read.
+        moment = getattr(customer, "last_purchase", None)
+        return moment.isoformat() if moment else None
+
+    def get_receipt_count(self, customer):
+        return getattr(customer, "receipt_count", None)
+
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise serializers.ValidationError("Enter the customer's name.")
+        return name
+
+    def validate_phone(self, value):
+        phone = (value or "").strip()
+        key = normalize_customer_phone(phone)
+        if not key:
+            return phone
+        branch = self.context.get("branch")
+        clash = Customer.objects.filter(phone_key=key)
+        if branch is not None:
+            clash = clash.filter(branch=branch)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        clash = clash.first()
+        if clash:
+            raise serializers.ValidationError(
+                f"{clash.name} is already on this shop's book with that number. "
+                "Open their account instead of starting a second one."
+            )
+        return phone
+
+    def validate_credit_limit(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("A credit limit cannot be negative.")
+        return value
+
+
+class CustomerPaymentSerializer(serializers.Serializer):
+    """Money handed in against an account rather than against one bill."""
+
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal("0.01"))
+    method = serializers.ChoiceField(choices=[
+        choice for choice in Payment.Method.choices
+        if choice[0] != Payment.Method.MPESA_STK
+    ])
+    reference = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+    def validate(self, data):
+        return _validate_payment_reference(data)
 
 
 class CheckoutItemSerializer(serializers.Serializer):
@@ -127,6 +212,11 @@ class StkPushSerializer(serializers.Serializer):
 class CheckoutSerializer(serializers.Serializer):
     customer_name = serializers.CharField(max_length=200, required=False, allow_blank=True)
     customer_phone = serializers.CharField(max_length=30, required=False, allow_blank=True)
+    # The account the goods go on, picked at the till. The two fields above stay:
+    # they are what got printed on the receipt and must never change afterwards.
+    customer = serializers.PrimaryKeyRelatedField(
+        queryset=Customer.objects.filter(is_active=True), required=False, allow_null=True
+    )
     idempotency_key = serializers.CharField(max_length=64, required=False, allow_blank=True)
     items = CheckoutItemSerializer(many=True, allow_empty=False)
     payments = CheckoutPaymentSerializer(many=True, required=False, allow_empty=True)
@@ -148,7 +238,9 @@ class CheckoutSerializer(serializers.Serializer):
         amount_paid = sum((payment["amount"] for payment in data.get("payments", [])), Decimal("0.00"))
         if amount_paid > total:
             raise serializers.ValidationError({"payments": "Payments cannot exceed the receipt total."})
-        if amount_paid < total and not (data.get("customer_name") or data.get("customer_phone")):
+        if amount_paid < total and not (
+            data.get("customer") or data.get("customer_name") or data.get("customer_phone")
+        ):
             raise serializers.ValidationError({
                 "customer": "Customer name or phone is required when a balance is unpaid."
             })

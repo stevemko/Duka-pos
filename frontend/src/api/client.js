@@ -262,6 +262,23 @@ export const receiptsApi = {
       .then((res) => res.data),
 };
 
+export const customersApi = {
+  list: (params) =>
+    client.get(`/customers/${queryString(params)}`).then((res) => normalizePage(res.data)),
+
+  create: (data) => client.post("/customers/", data).then((res) => res.data),
+
+  update: (id, data) => client.patch(`/customers/${id}/`, data).then((res) => res.data),
+
+  remove: (id) => client.delete(`/customers/${id}/`).then((res) => res.data),
+
+  ledger: (id) => client.get(`/customers/${id}/ledger/`).then((res) => res.data),
+
+  pay: (id, data) => client.post(`/customers/${id}/payments/`, data).then((res) => res.data),
+
+  debtors: () => client.get("/customers/debtors/").then((res) => res.data),
+};
+
 export const expensesApi = {
   list: (params) => getAllPages(`/expenses/${queryString(params)}`),
 

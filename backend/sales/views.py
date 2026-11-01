@@ -40,6 +40,7 @@ from expenses.models import Expense
 from products.models import Product
 from products.services import move_stock
 
+from .credit import check_credit_limit, find_customer
 from .models import Payment, Sale, SaleReceipt, stk_pending_cutoff
 from .mpesa import (
     MpesaError,
@@ -503,11 +504,28 @@ class SaleViewSet(viewsets.ModelViewSet):
                             "items": [f"{product.name} is not stocked at {branch.name}."]
                         })
 
+                # The number on the till's screen is the shop's promise about this
+                # basket. The debt is decided here, inside the same transaction as
+                # the receipts that create it.
+                customer = data.get("customer") or find_customer(
+                    branch, phone=data.get("customer_phone") or ""
+                )
+                basket_total = sum(
+                    (item["price_sold_at"] * item["quantity"] for item in data["items"]),
+                    Decimal("0.00"),
+                )
+                paid_now = sum(
+                    (payment["amount"] for payment in data.get("payments", [])),
+                    Decimal("0.00"),
+                )
+                check_credit_limit(customer, basket_total - paid_now)
+
                 receipt = SaleReceipt.objects.create(
                     branch=branch,
                     created_by=request.user if request.user.is_authenticated else None,
                     customer_name=(data.get("customer_name") or "").strip(),
                     customer_phone=(data.get("customer_phone") or "").strip(),
+                    customer=customer,
                     idempotency_key=idempotency_key or None,
                     idempotency_hash=fingerprint if idempotency_key else "",
                 )

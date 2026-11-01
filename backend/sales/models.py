@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -5,7 +6,17 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
-from django.db.models import Count, DecimalField, F, IntegerField, OuterRef, Q, Subquery, Sum
+from django.db.models import (
+    Count,
+    DecimalField,
+    F,
+    IntegerField,
+    Max,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+)
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -14,6 +25,153 @@ from products.models import Product
 
 def stk_pending_cutoff():
     return timezone.now() - timedelta(minutes=settings.MPESA_STK_PENDING_TIMEOUT_MINUTES)
+
+
+def normalize_customer_phone(phone):
+    """Put a shop-floor phone number in one shape, or return "" if it is not one.
+
+    Customers are matched by number, so 07XX, 07XX written as +2547XX, 0017XX and
+    2547XX must all land on the same ledger. A number that does not look like a
+    Kenyan mobile is left unkeyed rather than guessed at, and the profile stays
+    findable by name instead.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("254") and len(digits) >= 12:
+        digits = digits[3:]
+    if len(digits) == 10 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 9 and digits[0] in "17":
+        return f"254{digits}"
+    return ""
+
+
+class CustomerQuerySet(models.QuerySet):
+    def with_balances(self):
+        """Attach what each account owes, so a list of debtors costs one query.
+
+        Bought and paid are summed separately because a receipt carries two
+        one-to-many sets: joining items and payments together would multiply every
+        payment by the number of lines on its bill and invent money in the book.
+        """
+        bought = (
+            Sale.objects.filter(receipt__customer=OuterRef("pk"))
+            .values("receipt__customer")
+            .annotate(amount=Sum("total"))
+            .values("amount")
+        )
+        paid = (
+            Payment.objects.filter(
+                receipt__customer=OuterRef("pk"), status=Payment.Status.SUCCEEDED
+            )
+            .values("receipt__customer")
+            .annotate(amount=Sum("amount"))
+            .values("amount")
+        )
+        return self.annotate(
+            annotated_bought=Coalesce(
+                Subquery(bought, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                Decimal("0.00"),
+            ),
+            annotated_paid=Coalesce(
+                Subquery(paid, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                Decimal("0.00"),
+            ),
+            outstanding_amount=Coalesce(
+                Subquery(bought, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                Decimal("0.00"),
+            )
+            - Coalesce(
+                Subquery(paid, output_field=DecimalField(max_digits=12, decimal_places=2)),
+                Decimal("0.00"),
+            ),
+            # The receipts join is the only multi-row path here, so the sums above
+            # stay in subqueries: joining items and payments as well would multiply
+            # the rows underneath both aggregates and invent money.
+            last_purchase=Max("receipts__created_at"),
+            receipt_count=Count("receipts", distinct=True),
+        )
+
+
+class Customer(models.Model):
+    """A person the shop sells to, and the account their debts sit on.
+
+    The name and number printed on a receipt are the snapshot taken at the counter
+    and are never rewritten. This row is the running book underneath them, so a debt
+    still belongs to the same customer after a spelling correction or a new phone.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    # Each shop keeps its own credit book: the same person owing at two branches is
+    # two ledgers, because the money is owed to whichever shop let the goods go.
+    branch = models.ForeignKey(
+        "accounts.Branch",
+        on_delete=models.PROTECT,
+        related_name="customers",
+        null=True,
+        blank=True,
+    )
+    name = models.CharField(max_length=200)
+    phone = models.CharField(max_length=30, blank=True)
+    # Derived from phone by save(); empty when the number is not a recognisable
+    # Kenyan mobile, which keeps those rows out of the uniqueness check.
+    phone_key = models.CharField(max_length=30, blank=True)
+    # Left blank, the account has no ceiling: the shop decides per customer how much
+    # to let them carry, and an unset limit must not block a sale.
+    credit_limit = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    notes = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = CustomerQuerySet.as_manager()
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["branch", "phone_key"],
+                condition=~Q(phone_key=""),
+                name="unique_customer_phone_per_branch",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["phone_key"], name="customer_phone_key_idx"),
+            models.Index(fields=["branch", "name"], name="customer_branch_name_idx"),
+        ]
+
+    def save(self, *args, **kwargs):
+        self.phone_key = normalize_customer_phone(self.phone)
+        super().save(*args, **kwargs)
+
+    @property
+    def outstanding(self):
+        """What the shop is still waiting for on this account."""
+        if hasattr(self, "annotated_bought"):
+            owed = self.annotated_bought - self.annotated_paid
+        else:
+            bought = Sale.objects.filter(receipt__customer=self).aggregate(
+                amount=Sum("total")
+            )["amount"]
+            paid = Payment.objects.filter(
+                receipt__customer=self, status=Payment.Status.SUCCEEDED
+            ).aggregate(amount=Sum("amount"))["amount"]
+            owed = (bought or Decimal("0.00")) - (paid or Decimal("0.00"))
+        # Money paid beyond the bills is not a negative debt the shop owes back:
+        # it is change, and the till has to hand it over.
+        return owed if owed > 0 else Decimal("0.00")
+
+    @property
+    def credit_headroom(self):
+        """How much more this account may take on credit, or None if uncapped."""
+        if self.credit_limit is None:
+            return None
+        headroom = self.credit_limit - self.outstanding
+        return headroom if headroom > 0 else Decimal("0.00")
+
+    def __str__(self):
+        return self.name
 
 
 class SaleReceiptQuerySet(models.QuerySet):
@@ -74,6 +232,15 @@ class SaleReceipt(models.Model):
     )
     customer_name = models.CharField(max_length=200, blank=True)
     customer_phone = models.CharField(max_length=30, blank=True)
+    # The account this sale belongs to, when the till picked one. PROTECT: a
+    # customer with a receipt in the books cannot be deleted out of the ledger.
+    customer = models.ForeignKey(
+        Customer,
+        on_delete=models.PROTECT,
+        related_name="receipts",
+        null=True,
+        blank=True,
+    )
     idempotency_key = models.CharField(max_length=64, blank=True, null=True, unique=True)
     # A digest of the basket the key was first used with. A retry after a lost
     # answer must replay that same sale; the same key carrying a different

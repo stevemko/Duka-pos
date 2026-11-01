@@ -19,6 +19,7 @@ const navGroups = [
     items: [
       { to: "/", label: "Sell", icon: "cart", end: true },
       { to: "/transactions", label: "Transactions", icon: "receipt" },
+      { to: "/credit", label: "Credit book", icon: "users" },
       { to: "/inventory", label: "Inventory", icon: "package" },
     ],
   },

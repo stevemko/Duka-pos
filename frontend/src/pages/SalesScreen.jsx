@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { productsApi, receiptsApi, salesApi, apiErrorMessage } from "../api/client";
+import { customersApi, productsApi, receiptsApi, salesApi, apiErrorMessage } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { fromCents, money, toCents } from "../lib/format";
 import PrintableReceipt from "../components/PrintableReceipt";
@@ -91,6 +91,9 @@ export default function SalesScreen() {
   const [cart, setCart] = useState([]);
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
+  // The credit account this sale goes on, once the till has picked one.
+  const [customerId, setCustomerId] = useState("");
+  const [accounts, setAccounts] = useState([]);
   const [paymentMode, setPaymentMode] = useState("paid");
   const [partialAmount, setPartialAmount] = useState("");
   const [paymentMethod, setPaymentMethod] = useState("cash");
@@ -152,6 +155,7 @@ export default function SalesScreen() {
     setCart(draft.cart);
     setCustomerName(draft.customerName || "");
     setCustomerPhone(draft.customerPhone || "");
+    setCustomerId(draft.customerId || "");
     setPaymentMode(draft.paymentMode || "paid");
     setStatus({
       type: "warning",
@@ -164,7 +168,7 @@ export default function SalesScreen() {
     const key = draftKey(username, sellingBranchId);
     // Wait for the restore above, or an empty first render deletes the draft.
     if (!key || !draftRestored.current) return;
-    if (cart.length === 0 && !customerName && !customerPhone) {
+    if (cart.length === 0 && !customerName && !customerPhone && !customerId) {
       clearDraft(key);
       return;
     }
@@ -172,15 +176,34 @@ export default function SalesScreen() {
       cart,
       customerName,
       customerPhone,
+      customerId,
       paymentMode,
       savedAt: Date.now(),
     });
-  }, [cart, customerName, customerPhone, paymentMode, username, sellingBranchId]);
+  }, [cart, customerName, customerPhone, customerId, paymentMode, username, sellingBranchId]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
     return () => window.clearTimeout(timer);
   }, [search]);
+
+  // Suggest the accounts already on the credit book. The number is what identifies
+  // a customer, so a partial phone is a better search than a partial name - and a
+  // picked account is the only way a sale lands on someone's debt.
+  useEffect(() => {
+    const term = (customerPhone.trim() || customerName.trim()).replace(/\s+/g, "");
+    if (term.length < 3) {
+      setAccounts([]);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      customersApi
+        .list({ search: term })
+        .then((page) => setAccounts(page.results))
+        .catch(() => setAccounts([]));
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [customerPhone, customerName]);
 
   const rememberProducts = useCallback((products) => {
     setKnown((current) => {
@@ -371,10 +394,49 @@ export default function SalesScreen() {
     setCart((items) => items.filter((item) => item.product !== productId));
   }
 
+  function pickAccount(customer) {
+    if (!customer) {
+      setCustomerId("");
+      return;
+    }
+    setCustomerId(customer.id);
+    setCustomerName(customer.name);
+    if (customer.phone) setCustomerPhone(customer.phone);
+    invalidateKey();
+  }
+
+  async function saveNewAccount() {
+    const name = customerName.trim();
+    if (!name) {
+      setStatus({
+        type: "error",
+        message: "Type the customer's name before opening an account for them.",
+      });
+      return;
+    }
+    try {
+      const created = await customersApi.create({ name, phone: customerPhone.trim() });
+      setCustomerId(created.id);
+      setAccounts([created, ...accounts.filter((row) => row.id !== created.id)]);
+      invalidateKey();
+      setStatus({
+        type: "success",
+        message: `${created.name} is on the credit book. This sale will be recorded against them.`,
+      });
+    } catch (error) {
+      setStatus({
+        type: "error",
+        message: apiErrorMessage(error, "Could not open this account."),
+      });
+    }
+  }
+
   function resetCheckout() {
     setCart([]);
     setCustomerName("");
     setCustomerPhone("");
+    setCustomerId("");
+    setAccounts([]);
     setPaymentMode("paid");
     setPartialAmount("");
     setPaymentMethod("cash");
@@ -482,6 +544,7 @@ export default function SalesScreen() {
           branch: canViewAllBranches ? sellingBranchId || undefined : undefined,
           customer_name: customerName.trim(),
           customer_phone: customerPhone.trim(),
+          ...(customerId ? { customer: customerId } : {}),
           items: cart.map(({ product, quantity, price_sold_at }) => ({
             product,
             quantity: Number(quantity),
@@ -831,6 +894,10 @@ export default function SalesScreen() {
             onCustomerNameChange={setCustomerName}
             customerPhone={customerPhone}
             onCustomerPhoneChange={setCustomerPhone}
+            accounts={accounts}
+            customerId={customerId}
+            onPickAccount={pickAccount}
+            onSaveAccount={saveNewAccount}
             onSubmit={handleSubmit}
             loading={loading}
             blocked={blocked}

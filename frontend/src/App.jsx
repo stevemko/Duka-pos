@@ -11,6 +11,7 @@ import SalesScreen from "./pages/SalesScreen";
 import InventoryScreen from "./pages/InventoryScreen";
 import DashboardScreen from "./pages/DashboardScreen";
 import TransactionsScreen from "./pages/TransactionsScreen";
+import CreditScreen from "./pages/CreditScreen";
 import ExpensesScreen from "./pages/ExpensesScreen";
 import TeamScreen from "./pages/TeamScreen";
 
@@ -56,6 +57,7 @@ export default function App() {
             <Route element={<Layout />}>
               <Route path="/" element={<SalesScreen />} />
               <Route path="/transactions" element={<TransactionsScreen />} />
+              <Route path="/credit" element={<CreditScreen />} />
               <Route path="/inventory" element={<InventoryScreen />} />
               <Route path="/dashboard" element={<DashboardScreen />} />
               <Route path="*" element={<NotFoundScreen />} />
