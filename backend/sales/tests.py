@@ -1702,3 +1702,125 @@ class UnconfirmedStkPushTests(TestCase):
 
 		self.assertEqual(response.status_code, 400)
 		self.assertNotIn("confirmed", response.data)
+
+
+class ClosePeriodTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		self.cashier = get_user_model().objects.create_user(
+			username="till", password="archive-pass"
+		)
+		self.owner = get_user_model().objects.create_user(
+			username="owner", password="archive-pass", is_superuser=True, is_staff=True
+		)
+		self.client.force_authenticate(user=self.owner)
+		self.rice = Product.objects.create(
+			name="Rice",
+			sku="ARCHIVE-1",
+			cost_price="100.00",
+			selling_price="125.00",
+			stock_quantity=40,
+		)
+		self.close_url = reverse("receipt-close-period")
+
+	def _old_bill(self, paid="125.00", days_ago=40):
+		bill = self.client.post(
+			reverse("sale-checkout"),
+			{
+				"customer_name": "Amina",
+				"customer_phone": "0794671494",
+				"items": [{"product": str(self.rice.id), "quantity": 1, "price_sold_at": "125.00"}],
+				**({"payments": [{"amount": paid, "method": "cash"}]} if paid else {}),
+			},
+			format="json",
+		)
+		self.assertEqual(bill.status_code, 201, bill.data)
+		moment = timezone.now() - timedelta(days=days_ago)
+		pk = bill.data["id"]
+		SaleReceipt.objects.filter(pk=pk).update(created_at=moment)
+		Sale.objects.filter(receipt_id=pk).update(created_at=moment)
+		Payment.objects.filter(receipt_id=pk).update(created_at=moment)
+		return pk
+
+	def _day_ago(self, days_ago):
+		return (timezone.localdate() - timedelta(days=days_ago)).isoformat()
+
+	def test_a_closed_day_leaves_the_list_but_still_counts_in_the_totals(self):
+		pk = self._old_bill()
+		month = (timezone.localdate() - timedelta(days=40)).strftime("%Y-%m")
+
+		closed = self.client.post(
+			self.close_url, {"start_date": self._day_ago(45), "end_date": self._day_ago(35)}, format="json"
+		)
+		self.assertEqual(closed.status_code, 200, closed.data)
+		self.assertEqual(closed.data["closed"], 1)
+
+		self.assertEqual(self.client.get(reverse("receipt-list")).data["count"], 0)
+		archived = self.client.get(reverse("receipt-list"), {"include_closed": "1"})
+		self.assertEqual(archived.data["count"], 1)
+		self.assertEqual(str(archived.data["results"][0]["id"]), str(pk))
+
+		totals = self.client.get(reverse("sale-analytics"), {"month": month})
+		self.assertEqual(totals.data["total_sales"], Decimal("125.00"))
+		self.assertEqual(totals.data["items_sold"], 1)
+
+	def test_a_bill_still_owed_is_never_archived(self):
+		pk = self._old_bill(paid="")
+
+		closed = self.client.post(self.close_url, {"end_date": self._day_ago(35)}, format="json")
+		self.assertEqual(closed.data["closed"], 0)
+		self.assertEqual(closed.data["left_open"], 1)
+
+		listed = self.client.get(reverse("receipt-list"))
+		self.assertEqual(listed.data["count"], 1)
+		self.assertEqual(str(listed.data["results"][0]["id"]), str(pk))
+		credits = self.client.get(reverse("receipt-credits"))
+		self.assertEqual(credits.data["outstanding_total"], Decimal("125.00"))
+
+	def test_an_archived_bill_can_still_be_paid(self):
+		# A note handed over after the shop closed its paperwork on the day still
+		# has to be accepted, or the customer's debt would have nowhere to go.
+		pk = self._old_bill(paid="25.00")
+		self.client.post(self.close_url, {"end_date": self._day_ago(35)}, format="json")
+
+		self.assertEqual(
+			self.client.get(reverse("receipt-detail", kwargs={"pk": pk})).status_code, 200
+		)
+		paid = self.client.post(
+			reverse("receipt-payments", kwargs={"pk": pk}),
+			{"amount": "100.00", "method": "cash"},
+			format="json",
+		)
+		self.assertEqual(paid.status_code, 201, paid.data)
+		self.assertEqual(paid.data["balance"], "0.00")
+
+	def test_only_the_super_admin_can_close_a_period(self):
+		self.client.force_authenticate(user=self.cashier)
+		refused = self.client.post(self.close_url, {"end_date": self._day_ago(35)}, format="json")
+		self.assertEqual(refused.status_code, 403)
+
+	def test_the_day_still_trading_cannot_be_closed(self):
+		blocked = self.client.post(self.close_url, {"end_date": self._day_ago(0)}, format="json")
+		self.assertEqual(blocked.status_code, 400)
+		self.assertIn("end_date", blocked.data)
+
+	def test_reopening_a_period_brings_its_bills_back(self):
+		pk = self._old_bill()
+		period = {"start_date": self._day_ago(45), "end_date": self._day_ago(35)}
+		self.client.post(self.close_url, period, format="json")
+		self.assertEqual(self.client.get(reverse("receipt-list")).data["count"], 0)
+
+		undone = self.client.post(self.close_url, {**period, "undo": "true"}, format="json")
+		self.assertEqual(undone.data["reopened"], 1)
+		self.assertIsNone(SaleReceipt.objects.get(pk=pk).closed_at)
+		self.assertEqual(self.client.get(reverse("receipt-list")).data["count"], 1)
+
+	def test_a_cashier_cannot_call_archived_bills_back(self):
+		self._old_bill()
+		self.client.post(self.close_url, {"end_date": self._day_ago(35)}, format="json")
+		self.client.force_authenticate(user=self.cashier)
+
+		self.assertEqual(self.client.get(reverse("receipt-list")).data["count"], 0)
+		self.assertEqual(
+			self.client.get(reverse("receipt-list"), {"include_closed": "1"}).data["count"], 0
+		)

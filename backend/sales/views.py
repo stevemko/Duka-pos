@@ -22,10 +22,11 @@ from rest_framework.decorators import (
     throttle_classes,
 )
 from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from accounts.models import Branch
+from accounts.permissions import IsSuperUser
 from accounts.services import (
     branch_queryset,
     main_branch,
@@ -619,6 +620,12 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
         branch = _branch_scope(self.request.user, params.get("branch"))
         queryset = branch_queryset(queryset, branch)
 
+        # A closed period leaves the day-to-day list, not the books: the totals,
+        # the credit ledger and the receipt itself keep counting it. Only the
+        # super admin can ask for the archived rows back.
+        if not (params.get("include_closed") in {"1", "true", "yes"} and self.request.user.is_superuser):
+            queryset = queryset.filter(closed_at__isnull=True)
+
         period_start, period_end = _period_range(params)
         start_date = parse_date(params.get("start_date") or "")
         end_date = parse_date(params.get("end_date") or "")
@@ -723,6 +730,58 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
             "customer_count": len(customer_keys),
             "receipt_count": len(credit_records),
             "credits": credit_records,
+        })
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="close-period",
+        permission_classes=[IsAuthenticated, IsSuperUser],
+    )
+    def close_period(self, request):
+        """Put a finished stretch of trading away without destroying any of it."""
+        end_date = parse_date(str(request.data.get("end_date") or ""))
+        if not end_date:
+            raise ValidationError({"end_date": "Use YYYY-MM-DD format."})
+        start_date = parse_date(str(request.data.get("start_date") or ""))
+        if request.data.get("start_date") and not start_date:
+            raise ValidationError({"start_date": "Use YYYY-MM-DD format."})
+        if start_date and start_date > end_date:
+            raise ValidationError({"end_date": "End date must be on or after start date."})
+        undo = str(request.data.get("undo") or "").lower() in {"1", "true", "yes"}
+        today = timezone.localdate()
+        if not undo and end_date >= today:
+            raise ValidationError({
+                "end_date": "Today is still being traded. Close a period that has already ended."
+            })
+
+        branch = _branch_scope(request.user, request.data.get("branch"))
+        queryset = branch_queryset(_receipt_queryset(), branch)
+        window = {"created_at__date__lte": end_date}
+        if start_date:
+            window["created_at__date__gte"] = start_date
+
+        if undo:
+            reopened = queryset.filter(closed_at__isnull=False, **window).update(
+                closed_at=None, closed_by=None
+            )
+            return Response({"reopened": reopened, "end_date": end_date.isoformat()})
+
+        # Anything still owed stays in the list. A debt that has been archived is a
+        # debt nobody is looking at, and closing a period must never lose money.
+        owing_ids = list(
+            queryset.filter(closed_at__isnull=True, **window)
+            .filter(annotated_amount_paid__lt=F("annotated_total"))
+            .values_list("id", flat=True)
+        )
+        settled_count = queryset.filter(closed_at__isnull=True, **window).exclude(
+            pk__in=owing_ids
+        ).update(closed_at=timezone.now(), closed_by=request.user)
+        return Response({
+            "closed": settled_count,
+            "left_open": len(owing_ids),
+            "start_date": start_date.isoformat() if start_date else None,
+            "end_date": end_date.isoformat(),
         })
 
     @action(

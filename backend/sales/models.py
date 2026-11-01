@@ -247,6 +247,17 @@ class SaleReceipt(models.Model):
     # customer or tender is a mistake at the counter, not a duplicate request.
     idempotency_hash = models.CharField(max_length=64, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # A period the owner has put away. The row stays exactly as it was: the money
+    # owed on it still belongs to a customer, the totals still count, and it can
+    # still be paid. Closing only takes it out of the day-to-day list.
+    closed_at = models.DateTimeField(null=True, blank=True)
+    closed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        related_name="receipts_closed",
+        null=True,
+        blank=True,
+    )
 
     objects = SaleReceiptQuerySet.as_manager()
 

@@ -68,7 +68,7 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
         fields = [
             "id", "branch", "branch_name", "created_by_name", "customer", "customer_name",
             "customer_phone", "items", "payments", "total", "amount_paid", "balance",
-            "payment_status", "created_at",
+            "payment_status", "created_at", "closed_at",
         ]
 
     def get_branch_name(self, receipt):

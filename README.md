@@ -21,7 +21,7 @@ duka-pos/
 | Sell | Server-paginated product picker with search, category filter and Enter-to-scan SKU; cart, cash/change, Paybill, STK prompt, mobile money, card, bank, credit and part-payment; printable receipt after every sale. |
 | Wholesale cost floor | Retail is the marked price; wholesale is the initial cost. Selling below retail is allowed (with a discount note), but a sale below wholesale cost is blocked in the browser, the API and the database with a red alert. |
 | Inventory | Thousands of products with fast server search and "load more"; stock, wholesale cost, retail price, margin, images, low-stock filters, CSV price-list import and template, per-branch stock. |
-| Transactions | Every receipt is kept forever: date, customer, cashier, items, payments, balance, status. Filter by day/week/month, search, export CSV. |
+| Transactions | Every receipt is kept forever: date, customer, cashier, items, payments, balance, status. Filter by day/week/month, search, export CSV. The super admin can close an old period so settled bills leave the daily list without being deleted. |
 | Credits | Outstanding balances per customer, one-click settle, M-Pesa prompt from the receipt. |
 | Expenses | Rent, salaries, stock, transport and other money-out entries, with category summaries and net profit. |
 | Team & passwords | Only the super admin creates logins, assigns roles and reset passwords. Managers open branches and oversee shop operations; everyone can change their own password. |
@@ -31,8 +31,8 @@ duka-pos/
 ## Roles
 
 - **Super admin** (`is_superuser=True`): the only role that creates accounts,
-  assigns roles, resets passwords and deactivates logins. Also has full access
-  to money, expenses, branches and all reports.
+  assigns roles, resets passwords, deactivates logins and closes an old trading
+  period. Also has full access to money, expenses, branches and all reports.
 - **Manager** (`is_staff=True`): full shop oversight: sells, manages
   inventory, expenses, branches and all-branch reports. Cannot create staff
   accounts or reset other people's passwords.
@@ -107,12 +107,23 @@ restart Vite.
   than six hours is dropped, because its prices and stock are no longer true.
   Switching branch always starts a fresh basket.
 - **End of day**: **Transactions** defaults to today. Check the totals in view,
-  open any receipt to print, then **Export CSV** for your records/accountant.- **Month end**: **Dashboard**, choose the month, export the transaction CSV
+  open any receipt to print, then **Export CSV** for your records/accountant.
+- **Month end**: **Dashboard**, choose the month, export the transaction CSV
   and review gross profit, expenses and net profit.
+- **Closing an old period** (super admin only): on **Transactions**, set the
+  date range you have finished with, **Export CSV** and keep that file, then
+  **Close period** and give it the last day of the period. Settled bills leave
+  the daily list and the till's recent panel. Nothing is deleted: the totals,
+  the dashboard, the credit book and the receipt itself are unchanged, and a
+  closed bill can still take a payment. A bill that still owes is never
+  archived — it stays in the list until it is paid. Tick **Show receipts from
+  closed periods** to see archived rows again (badged *Closed*), or press
+  **Reopen it instead** in the same dialog to bring a period back.
 
 Sales and payments are immutable: once saved they cannot be edited or deleted,
 which keeps the books auditable. Mistakes are corrected with a new entry, not
-by erasing history.
+by erasing history. Closing a period works the same way: it hides paperwork
+from the counter's view, it does not destroy it.
 
 ## M-Pesa: sandbox → real Paybill
 

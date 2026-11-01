@@ -260,6 +260,9 @@ export const receiptsApi = {
     client
       .get(`/receipts/export/${queryString(params)}`, { responseType: "blob" })
       .then((res) => res.data),
+
+  closePeriod: (data) =>
+    client.post("/receipts/close-period/", data).then((res) => res.data),
 };
 
 export const customersApi = {

@@ -87,7 +87,7 @@ function downloadBlob(blob, filename) {
 }
 
 export default function TransactionsScreen() {
-  const { branchQuery, canViewAllBranches, activeBranch } = useAuth();
+  const { branchQuery, canViewAllBranches, activeBranch, canManageUsers } = useAuth();
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = searchParams.get("tab") === "credits" ? "credits" : "receipts";
 
@@ -97,6 +97,8 @@ export default function TransactionsScreen() {
   const [status, setStatus] = useState("");
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [showClosed, setShowClosed] = useState(false);
+  const [periodDialog, setPeriodDialog] = useState(false);
 
   const [receipts, setReceipts] = useState([]);
   const [nextUrl, setNextUrl] = useState(null);
@@ -123,8 +125,9 @@ export default function TransactionsScreen() {
       ...(tab === "receipts" && status ? { status } : {}),
       ...(debouncedSearch ? { q: debouncedSearch } : {}),
       ...(branchQuery ? { branch: branchQuery } : {}),
+      ...(tab === "receipts" && showClosed && canManageUsers ? { include_closed: "1" } : {}),
     }),
-    [tab, range, status, debouncedSearch, branchQuery],
+    [tab, range, status, debouncedSearch, branchQuery, showClosed, canManageUsers],
   );
 
   const loadReceipts = useCallback(async () => {
@@ -221,6 +224,11 @@ export default function TransactionsScreen() {
             <Button variant="secondary" icon="refresh" onClick={loadReceipts}>
               Refresh
             </Button>
+            {canManageUsers && (
+              <Button variant="secondary" icon="lock" onClick={() => setPeriodDialog(true)}>
+                Close period
+              </Button>
+            )}
             <Button icon="download" loading={exporting} onClick={exportCsv}>
               Export CSV
             </Button>
@@ -336,6 +344,17 @@ export default function TransactionsScreen() {
             </div>
           </div>
 
+          {canManageUsers && tab === "receipts" && (
+            <label className="flex w-fit items-center gap-2 text-xs font-semibold text-ink-600">
+              <input
+                type="checkbox"
+                checked={showClosed}
+                onChange={(event) => setShowClosed(event.target.checked)}
+              />
+              Show receipts from closed periods
+            </label>
+          )}
+
           {preset === "custom" && tab === "receipts" && (
             <div className="grid gap-3 sm:grid-cols-2 lg:max-w-md">
               <Field label="From">
@@ -365,7 +384,9 @@ export default function TransactionsScreen() {
             message={
               tab === "credits"
                 ? "Every customer has cleared their balance. New credit sales will appear here."
-                : "Try a wider date range or clear the search and status filters."
+                : showClosed || !canManageUsers
+                  ? "Try a wider date range or clear the search and status filters."
+                  : "Try a wider date range or clear the filters. Bills from a period the owner closed stay out of this list until 'Show receipts from closed periods' is ticked."
             }
           />
         ) : (
@@ -388,7 +409,14 @@ export default function TransactionsScreen() {
               <tbody>
                 {receipts.map((receipt) => (
                   <tr key={receipt.id} className="transition-colors hover:bg-ink-50/70">
-                    <Td className="font-semibold text-ink-900">{shortId(receipt.id)}</Td>
+                    <Td className="font-semibold text-ink-900">
+                      {shortId(receipt.id)}
+                      {receipt.closed_at && (
+                        <Badge tone="neutral" className="ml-2">
+                          closed
+                        </Badge>
+                      )}
+                    </Td>
                     <Td className="whitespace-nowrap text-xs text-ink-500">
                       {formatDateTime(receipt.created_at)}
                     </Td>
@@ -458,7 +486,140 @@ export default function TransactionsScreen() {
         onUpdated={updateSelected}
         onRefresh={loadReceipts}
       />
+
+      {periodDialog && (
+        <ClosePeriodDialog
+          branchQuery={branchQuery}
+          onClose={() => setPeriodDialog(false)}
+          onClosed={loadReceipts}
+        />
+      )}
     </div>
+  );
+}
+
+function ClosePeriodDialog({ onClose, branchQuery, onClosed }) {
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [notice, setNotice] = useState(null);
+
+  const yesterday = useMemo(() => {
+    const day = new Date();
+    day.setDate(day.getDate() - 1);
+    return isoDate(day);
+  }, []);
+
+  function period() {
+    if (!end) return null;
+    return {
+      ...(start ? { start_date: start } : {}),
+      end_date: end,
+      ...(branchQuery ? { branch: branchQuery } : {}),
+    };
+  }
+
+  async function downloadCsv() {
+    const body = period();
+    if (!body) {
+      setNotice({ tone: "error", message: "Pick the last day of the period first." });
+      return;
+    }
+    setDownloading(true);
+    try {
+      const blob = await receiptsApi.exportCsv(body);
+      downloadBlob(blob, `transactions-${body.start_date || "start"}-to-${body.end_date}.csv`);
+      setNotice(null);
+    } catch {
+      setNotice({ tone: "error", message: "Could not download the file for that period." });
+    } finally {
+      setDownloading(false);
+    }
+  }
+
+  async function closePeriod(undo) {
+    const body = period();
+    if (!body) {
+      setNotice({
+        tone: "error",
+        message: "Pick the last day of the period you want to put away.",
+      });
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      const result = await receiptsApi.closePeriod({
+        ...body,
+        ...(undo ? { undo: "true" } : {}),
+      });
+      onClosed();
+      setNotice(
+        undo
+          ? { tone: "success", message: `${result.reopened} receipt(s) are back in the daily list.` }
+          : {
+              tone: "success",
+              message: result.left_open
+                ? `${result.closed} settled receipt(s) put away. ${result.left_open} still owed stay in the list.`
+                : `${result.closed} settled receipt(s) put away. Nothing owed was hidden.`,
+            },
+      );
+    } catch (requestError) {
+      setNotice({ tone: "error", message: apiErrorMessage(requestError, "Could not close that period.") });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Close a trading period"
+      subtitle="Settled bills leave the daily list. Totals, credit and the receipts themselves are kept."
+      footer={
+        <>
+          <Button variant="ghost" onClick={() => closePeriod(true)} disabled={busy}>
+            Reopen it instead
+          </Button>
+          <Button variant="secondary" icon="download" loading={downloading} onClick={downloadCsv}>
+            Export first
+          </Button>
+          <Button icon="lock" loading={busy} onClick={() => closePeriod(false)}>
+            Close period
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Field label="From (optional)">
+            <Input
+              type="date"
+              value={start}
+              max={end || yesterday}
+              onChange={(event) => setStart(event.target.value)}
+            />
+          </Field>
+          <Field label="Last day of the period" required hint="Today is still being traded, so it cannot be closed.">
+            <Input
+              type="date"
+              value={end}
+              max={yesterday}
+              onChange={(event) => setEnd(event.target.value)}
+            />
+          </Field>
+        </div>
+
+        {notice && <Alert tone={notice.tone}>{notice.message}</Alert>}
+
+        <p className="rounded-xl bg-ink-50 px-4 py-3 text-xs text-ink-600">
+          Download the period before closing it and keep the file. A closed bill is still on the
+          books and can still be paid; only the daily list stops showing it.
+        </p>
+      </div>
+    </Modal>
   );
 }
 
