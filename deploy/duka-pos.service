@@ -1,0 +1,63 @@
+# The shop's server, run as a service so it comes back after a power cut.
+#
+# Install as /etc/systemd/system/duka-pos.service on the VPS, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now duka-pos
+#   systemctl status duka-pos
+#   journalctl -u duka-pos -f
+#
+# Paths assume the project lives in /srv/duka-pos and the virtualenv is the one
+# created in deploy/DEPLOY-VPS.md. Change both here and nowhere else.
+
+[Unit]
+Description=Green Light POS (Django + gunicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=duka
+Group=www-data
+
+WorkingDirectory=/srv/duka-pos/backend
+
+# No EnvironmentFile here on purpose: systemd keeps the quotation marks that a
+# .env file uses, and a quoted SECRET_KEY or M-Pesa key then fails in a way that
+# looks like a bad key. settings.py reads /srv/duka-pos/backend/.env itself.
+
+# The server refuses to start on a settings mistake that would lose money: an
+# unwritable media folder, or an M-Pesa callback URL Safaricom cannot reach.
+# Read the warnings too, but do not let them stop trading from a shop LAN:
+#   python manage.py check --deploy
+ExecStartPre=/srv/duka-pos/backend/backend_venv/bin/python manage.py check --deploy --fail-level ERROR
+ExecStartPre=/srv/duka-pos/backend/backend_venv/bin/python manage.py migrate --noinput
+ExecStartPre=/srv/duka-pos/backend/backend_venv/bin/python manage.py collectstatic --noinput --clear
+
+# One process, several threads. The shop's books are a single SQLite file, and
+# two workers writing the same sale is how a counter gets "database is locked"
+# and a half-recorded bill. Threads share the one connection pool, so the till
+# still serves several tills at once. Move to --workers >1 only with PostgreSQL.
+ExecStart=/srv/duka-pos/backend/backend_venv/bin/gunicorn config.wsgi:application \
+    --bind 127.0.0.1:8000 \
+    --workers 1 \
+    --threads 8 \
+    --timeout 45 \
+    --graceful-timeout 30 \
+    --access-logfile - --error-logfile -
+
+Restart=always
+RestartSec=5
+
+# A stopped service must not leave a half-written database behind.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+# /usr and /boot become read-only for this service; /srv stays writable, which is
+# where the media folder, the database and the logs live.
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

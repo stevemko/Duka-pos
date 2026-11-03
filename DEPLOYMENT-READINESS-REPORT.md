@@ -23,17 +23,26 @@ logic:
 |---|---------|---------------|
 | 1 | Rotate the M-Pesa Daraja sandbox keys | The sandbox consumer key/secret were pasted into this chat. Anyone with the transcript can use them. Generate new ones before any production use. |
 | 2 | Never ship `backend/.env` | It holds live credentials. Only `backend/.env.example` belongs in the repo/zip. |
-| 3 | Deploy with `DEBUG=False`, HTTPS and PostgreSQL | Django's own `check --deploy` reports 5 security items locally; all five disappear once the production env vars from `.env.example` are set behind TLS. SQLite is not the multi-year, multi-branch store. |
+| 3 | Deploy with `DEBUG=False` and HTTPS | Django's own `check --deploy` reports 5 security items locally; they disappear once the production env vars from `.env.example` are set behind TLS. The database stays SQLite for now - one gunicorn process with threads, `backup_shop` copying the one file - and `DATABASE_URL` is the switch to PostgreSQL when the books outgrow it. |
 | 4 | Replace the demo data | Today's ledger is test sales (see §6). Opening stock, real SKUs and prices must be loaded from your own list before the first customer. |
 | 5 | One real M-Pesa test | Paybill, short code and callback URL must be proven with one real KES 1 STK push and one lost-callback reconciliation before you depend on it. |
 
 After those five, the system is fit for a busy counter.
 
+**Since the audit date (2026-11-03)** the money holes named in §5 were closed (late
+and duplicated callbacks, a second prompt on a bill Daraja is still holding,
+overpayment invisible to the till), `manage.py check_mpesa` was added as the Daraja
+pre-flight, `backup_shop` became engine-aware and writes a manifest, the startup
+system checks were split into trade-blockers and deploy-only opening checks, and the
+deployment files a server actually installs (`deploy/duka-pos.service`,
+`deploy/nginx-duka.conf`, `deploy/DEPLOY-VPS.md`) replaced the prose in `README.md`.
+
 ---
 
 ## 2. Evidence — the commands and the actual output
 
-Run from the project copy on 2026-10-30:
+Run from the project copy on 2026-10-30 (the virtualenv was `.venv` then; both
+machines use `backend_venv` now):
 
 ```text
 backend:  .venv\Scripts\python manage.py test
@@ -58,6 +67,35 @@ The `W004/W008/W012/W016/W018` warnings and the `No directory at: backend\static
 notice are local-environment artefacts: the settings only enable those flags when
 `DEBUG=False`, and `collectstatic` is a deploy-time step. They are not code defects.
 
+Re-run on 2026-11-03 after the money-path, pre-flight, backup and startup-check work:
+
+```text
+backend:  backend_venv\Scripts\python manage.py test
+          Ran 199 tests in 504.202s
+          OK
+          System check identified no issues (0 silenced)
+
+backend:  backend_venv\Scripts\python manage.py check
+          System check identified no issues (0 silenced)
+
+backend:  backend_venv\Scripts\python manage.py check --deploy --fail-level ERROR
+          against a production-shaped environment  -> 1 warning (security.W021), exit 0
+          with MPESA_CALLBACK_URL=http://192.168.1.9 -> config.E013 + config.E014, exit 1
+
+backend:  backend_venv\Scripts\python manage.py check_mpesa --skip-live
+          all seven settings reported by name, sandbox warned, exit 0
+
+frontend: npm run lint   -> oxlint: 0 warnings and 0 errors (31 files, 103 rules)
+frontend: npm test       -> vitest: 1 file, 13 tests passed
+frontend: npm run build  -> vite: built in 1.42s (index.js 472.06 kB │ gzip 140.47 kB)
+```
+
+The two `check --deploy` runs are the point: the settings gate a server boots on
+must stay green for a shop that is configured right and refuse one that is not.
+The 2026-10-30 `check --deploy` output above lists Django's own `security.*`
+warnings; the new `config.W010`-`W019`/`E010`-`E015` ids are this project's and are
+namespaced, so they cannot be confused with Django's.
+
 Browser verification (Chrome via the local app at `127.0.0.1:5174`, API at `127.0.0.1:8001`):
 
 - Completed a sale as cashier and as manager; receipt, ledger, dashboard and analytics
@@ -74,26 +112,58 @@ Browser verification (Chrome via the local app at `127.0.0.1:5174`, API at `127.
 - Console showed no application errors on login, till, inventory, expenses, dashboard
   or transactions.
 
+Re-checked in the browser on 2026-11-03 against a throwaway sandbox database
+(`DATABASE_PATH` pointed at a copy outside the repo - the shop's own books were
+never used for testing):
+
+- Completed a cash sale on the till, then printed from the success card while a
+  "Print receipt" button was also present on the recent-receipts row: the page held
+  exactly **one** `.print-receipt` node, a direct child of `<body>`, containing only
+  the receipt just sold. The duplicate-on-paper defect is closed in the DOM, and the
+  `@media print` rule that hides `body > *:not(.print-receipt)` is present in the
+  stylesheet. The shop's physical printer still needs one real sheet to prove the
+  roll feeds correctly.
+- Read the seeded 12-line receipt that has a return with no refund handed back:
+  `GET /api/receipts/<id>/` returned `net_total 17500.00`, `amount_paid 18000.00`,
+  `balance 0.00` and `overpaid_amount 500.00` - the surplus the till is holding is
+  visible instead of vanishing from every figure.
+
 ---
 
 ## 3. What is covered by tests
 
-`backend/` — 85 tests across five apps:
+`backend/` — 199 tests across six apps (85 at the first audit; the rest were added
+by the go-live work):
 
 - **sales**: checkout, integer-cent money maths, cost-floor block, stock decrement and
   rollback, idempotent replay, over-sale rejection, credit + payment recording,
   receipt list/detail/export, analytics totals and per-category breakdown, branch
   isolation, M-Pesa STK push, query, callback signature check, amount mismatch →
-  FAILED, duplicate callback ignored, reconciler command.
+  FAILED, duplicate callback ignored, reconciler command. Plus the money holes closed
+  on the way to Daraja: a prompt Safaricom is still holding is never failed by the
+  local clock, a second prompt is refused while one is open, a callback that arrives
+  late pays a prompt the till had given up on, a wrong-amount late callback does not,
+  an overpaid bill reports what the till is holding (and a refund already handed back
+  is not counted twice), a full return leaves no second debt, and returns wait while a
+  prompt on that bill is open. `check_mpesa` is tested too, including that it never
+  prints a secret value and that `--test-stk` records no payment.
 - **products**: CRUD, per-branch SKU uniqueness, CSV import (skip existing, bad rows
   reported, size/encoding guards), low-stock and cost-value masking for cashiers.
 - **accounts**: login throttle, token expiry, super-admin-only account and password
-  management, manager-only staff writes, branch assignment rules.
+  management, manager-only staff writes, branch assignment rules, and `backup_shop`
+  on both engines - the manifest it writes, the copy and its note pruned as one set,
+  and the `pg_dump` branch proved by test (password in the environment, never in the
+  command line or the manifest).
 - **expenses**: CRUD, month/branch/category summaries, cashier write block, manager
   can only touch their own branch.
 - **alerts**: restock alert created when a sale empties stock, no same-day duplicate,
   none when stock is healthy, endpoint requires authentication, WhatsApp send skipped
   when Twilio is unconfigured, branch staff only see their own shop's alerts.
+- **config**: `host_is_public` against names, IPs, link-local, `.local`, bare
+  hostnames and empty input; the trade blockers that stop a shop from selling (media
+  unwritable, callback not public HTTPS, placeholder callback token) and the same
+  sentences downgraded to warnings while `DEBUG=True` so a laptop with a tunnel
+  address still starts; the deploy-only opening checks.
 
 `frontend/` — 13 tests on the money helpers (`toCents`, `fromCents`, `cleanMoney`,
 `cleanWholeNumber`, `money`, `monthBounds`, `currentMonth`), including the rounding
@@ -136,12 +206,15 @@ key is kept until a checkout succeeds or the basket is cleared.
 
 1. Rotate Daraja keys; keep sandbox keys out of production entirely.
 2. Set the production environment exactly as `backend/.env.example`: `DEBUG=False`,
-   `SECRET_KEY` (new), `DATABASE_URL` (Postgres), `ALLOWED_HOSTS`,
-   `CSRF_TRUSTED_ORIGINS`, `MPESA_*` with the real Paybill and the public callback URL.
+   `SECRET_KEY` (new), `ALLOWED_HOSTS`, `CSRF_TRUSTED_ORIGINS`, `MPESA_*` with the
+   real Paybill and the public callback URL. Leave `DATABASE_URL` empty to stay on
+   SQLite - the supported choice, and the one the shop already trades on; set it only
+   when the books outgrow one file.
 3. Run the M-Pesa reconciler every 5 minutes (`manage.py reconcile_mpesa --older-than 5`);
    lost callbacks are otherwise stuck pending.
-4. Put the three "must not lose" things in place before day one: nightly `pg_dump`
-   offsite, `backend/media/` backed up, and a tested restore.
+4. Put the three "must not lose" things in place before day one: nightly
+   `manage.py backup_shop` to a second disk plus a copy carried off the machine,
+   `backend/media/` backed up with it (the command does both), and a tested restore.
 5. Load your real products and opening stock (Inventory → Import CSV), then correct
    any quantity by hand once.
 
@@ -265,24 +338,32 @@ any of this.
 
 ## 8. Deploying it
 
-Full, tested instructions are in `README.md` → **Deployment** (VPS + PostgreSQL +
-nginx + gunicorn, the nginx block, backups, PaaS notes, M-Pesa go-live checklist).
-Short version:
+Full, step-by-step instructions are in `deploy/DEPLOY-VPS.md` - the runbook with
+the checks to run between the steps - and the shapes of the files it installs are
+`deploy/duka-pos.service` and `deploy/nginx-duka.conf`. `README.md` → **Deployment**
+summarises both. Short version:
 
 ```bash
 # on the server, from the project root
 cd backend
-python -m venv .venv && source .venv/bin/activate
+python3 -m venv backend_venv && source backend_venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env            # then fill in the production values, DEBUG=False
+python manage.py check_mpesa    # keys, callback URL, path - before anything else
+python manage.py check --deploy # read it; the service unit boots on this gate
 python manage.py migrate --noinput
-python manage.py collectstatic --noinput
+python manage.py collectstatic --noinput --clear
 python manage.py createsuperuser
-gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 3
+gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 1 --threads 8
 
-cd ../frontend
-npm ci && npm run build         # copy dist/ to the nginx web root
+cd ../frontend                   # build on the laptop, rsync dist/ to the server
+npm ci && npm run build
 ```
+
+The worker rule is the one that keeps the books safe: **SQLite means one process,
+several threads.** Two gunicorn workers writing the same file produce "database is
+locked" errors and, worse, half-recorded bills. `(2 × cores) + 1` workers becomes
+correct only after the database moves to PostgreSQL.
 
 Then: certbot for TLS, systemd for gunicorn, the 5-minute reconciler cron, and the
 first real KES 1 M-Pesa test. Deploy only when §2's three commands are green.
@@ -291,7 +372,7 @@ first real KES 1 M-Pesa test. Deploy only when §2's three commands are green.
 
 ## 9. One-line answer
 
-The code is ready: 85 backend tests, 13 frontend tests, clean lint and build, and every
-screen driven in the browser. Deploy it against PostgreSQL with new M-Pesa credentials
-and your own opening stock, and treat the six test receipts in this demo database as
-yours to delete.
+The code is ready: the backend and frontend suites pass, lint and build are clean,
+and every screen was driven in the browser. Deploy it on SQLite with new M-Pesa
+credentials and your own opening stock, and treat the receipts left over from the
+demo database as yours to delete.

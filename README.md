@@ -60,7 +60,7 @@ duka-pos/
 
 ## Local setup
 
-Requirements: Python 3.14+, Node.js 20+.
+Requirements: Python 3.12 or newer (the shop machine runs 3.13), Node.js 20+.
 
 ```bash
 cd backend
@@ -189,6 +189,22 @@ Restart the backend after changing `.env`. The app appends
 `?token=MPESA_CALLBACK_TOKEN` to the callback URL and rejects callbacks with a
 missing or wrong token.
 
+Before the first real payment, run the pre-flight on the machine that will trade:
+
+```bash
+python manage.py check_mpesa
+```
+
+It prints each of the settings above by name with a character count only - never
+a value, so its output is safe to paste into a support chat - then checks the
+environment, whether the callback URL is public HTTPS and on the path this app
+serves, and finally asks Daraja for a token for real. A key from the sandbox
+stuck in the production app (or the reverse) is the most common way to lose a
+day of trading, and that is the one error it explains in those words.
+`--test-stk 07XXXXXXXX` then sends yourself a KES 1 prompt that is deliberately
+**not** saved as a payment, because a test row in an append-only ledger is
+something the till would spend the day reconciling.
+
 ### 3. Test the real Paybill
 
 **STK prompt (customer enters PIN on the phone):**
@@ -202,6 +218,26 @@ missing or wrong token.
 5. Test failure paths too: cancel the prompt, enter a wrong PIN, use an
    unregistered number, and turn the phone off. Failed prompts stay visible in
    the payment history with Safaricom's reason.
+
+**What "waiting" means, and why it can outlast the timeout**
+
+A prompt the till cannot finish is left open rather than closed on a clock,
+because guessing wrong costs money in one direction only:
+
+- A prompt Daraja has accepted (it has a checkout request id) is Safaricom's
+  question to answer. It stays `pending` past
+  `MPESA_STK_PENDING_TIMEOUT_MINUTES`, and **Check status** keeps working for it;
+  the scheduled `reconcile_mpesa` asks for up to `--older-than` window. A second
+  prompt on the same bill is refused while that one is open, so the customer
+  cannot be asked to pay twice for one bill.
+- A prompt Daraja never accepted has nothing coming, so the clock does close it
+  and the cashier can send another.
+- A callback that arrives after the bill was written off or paid in cash is still
+  believed: if the amount matches, the money is recorded and the bill is settled.
+  That shows as **overpaid** on the till - the amount the shop is holding back
+  for that customer - instead of vanishing from every figure.
+- A return cannot be recorded while a prompt on that bill is still waiting, so a
+  refund is never handed over cash that M-Pesa is about to pay again.
 
 **Manual Paybill at the counter (customer pays from their phone):**
 
@@ -227,6 +263,13 @@ missing or wrong token.
 - [ ] A KES 1 live STK payment succeeds and appears on the receipt.
 - [ ] A KES 1 manual Paybill payment is recorded with its confirmation code.
 - [ ] `reconcile_mpesa` runs every 5 minutes (see below).
+- [ ] `manage.py check_mpesa` passes with the production keys, and
+      `check_mpesa --test-stk <your phone>` brings a prompt to your handset.
+- [ ] `curl -o /dev/null -w '%{http_code}\n' https://<domain>/api/mpesa/callback/`
+      prints 405 or 403 - and the reverse proxy does not rate-limit that path
+      (`deploy/nginx-duka.conf` keeps it out of the limiter on purpose).
+- [ ] One real payment marked its bill **Paid** on its own, without anyone
+      pressing **Check status**, and printed one receipt, not two.
 - [ ] Staff know that STK requests are whole shillings; cents stay on the
       balance and can be settled in cash.
 
@@ -293,55 +336,60 @@ internet or the server link drops - stock, prices and payments always come from
 the server, so an unreachable server means "cannot sell right now", never a
 stale answer.
 
-### VPS + PostgreSQL + nginx + gunicorn (only if the shop wants a public URL)
+### VPS with a public URL (only if the shop wants customers or tills outside the LAN)
 
-1. Install Python 3.14, PostgreSQL and nginx on the server.
-2. Create the database and a dedicated OS user, then clone the project.
-3. `backend/.env` with production values (`DEBUG=False`, `DATABASE_URL`,
-   `SECRET_KEY`, `ALLOWED_HOSTS`, M-Pesa).
-4. Install dependencies, then:
+`deploy/DEPLOY-VPS.md` is the file to follow - it is the sequence actually used,
+with the checks to run between the steps. This section is the shape of it.
 
-```bash
-cd backend
-python manage.py migrate --noinput
-python manage.py collectstatic --noinput
-gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 3
-```
-
-Run gunicorn under systemd (restart on failure) or a process manager. With a
-multi-core server use `(2 × cores) + 1` workers; each worker is an independent
-process.
-
-5. Build the frontend and copy `frontend/dist` to the web root:
+1. Python 3.12+, nginx, a dedicated `duka` user, the project under
+   `/srv/duka-pos`, `.env` owned by `duka` mode `600` and never rsynced.
+2. Build the frontend on the laptop and rsync `frontend/dist/` to the server;
+   the server does not need Node.
+3. One virtualenv per machine, named `backend_venv` in both cases:
 
 ```bash
-cd frontend
-npm ci
-npm run build
+cd /srv/duka-pos/backend
+python3 -m venv backend_venv
+backend_venv/bin/pip install -r requirements.txt
+backend_venv/bin/python manage.py check --deploy   # read this before migrating
+backend_venv/bin/python manage.py check_mpesa      # proves the Daraja keys and callback
+backend_venv/bin/python manage.py migrate --noinput
+backend_venv/bin/python manage.py collectstatic --noinput --clear
 ```
 
-6. nginx serves the SPA and proxies the API:
+4. Serve it with `deploy/duka-pos.service`. The worker rule is the one that keeps
+   the books safe: **with SQLite, one process and several threads** - two gunicorn
+   workers writing the same file produce "database is locked" errors and, worse,
+   half-recorded bills. `(2 × cores) + 1` only becomes correct the day the
+   database is PostgreSQL:
 
-```nginx
-server {
-    listen 443 ssl;
-    server_name pos.yourdomain.com;
-    client_max_body_size 10m;
-
-    root /srv/duka-pos/frontend/dist;
-    index index.html;
-
-    location /api/ { proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }
-    location /admin/ { proxy_pass http://127.0.0.1:8000; proxy_set_header Host $host; proxy_set_header X-Forwarded-Proto $scheme; }
-    location /static/ { alias /srv/duka-pos/backend/staticfiles/; }
-    location /media/ { alias /srv/duka-pos/backend/media/; }
-    location / { try_files $uri /index.html; }
-}
+```bash
+gunicorn config.wsgi:application --bind 127.0.0.1:8000 --workers 1 --threads 8
 ```
 
-Use certbot/Let's Encrypt for TLS. Keep `SECURE_SSL_REDIRECT=True`,
-`SESSION_COOKIE_SECURE=True`, `CSRF_COOKIE_SECURE=True` and
-`SECURE_HSTS_SECONDS` as in `.env.example`.
+   The unit runs `manage.py check --deploy --fail-level ERROR` before it starts,
+   so a server whose callback URL is unreachable refuses to boot instead of
+   quietly losing paid customers.
+
+5. Serve it with `deploy/nginx-duka.conf` (copy to
+   `/etc/nginx/sites-available/duka-pos`), then get TLS with certbot. It splits
+   the M-Pesa callback out of the rate limiter - a throttled callback is a lost
+   payment - and keeps `/sw.js` and `/index.html` un-cached so tills pick up a
+   new build. After TLS is up, verify the callback route answers:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' https://pos.example.co.ke/api/mpesa/callback/
+```
+
+   It must print **405** (or 403). A 200 means it is accepting requests it should
+   not, a 404 means the URL in `.env` does not match the route.
+
+Keep `DEBUG=False`, `SESSION_COOKIE_SECURE=True`, `CSRF_COOKIE_SECURE=True`,
+`SECURE_SSL_REDIRECT=True` and `SECURE_HSTS_SECONDS` as in `.env.example`.
+
+**Database**: staying on SQLite is a supported choice - it is the same file the
+shop machine uses, and `backup_shop` copies it. `DATABASE_URL` is the switch to
+PostgreSQL when the books outgrow one file; nothing else changes.
 
 A PaaS (Render, Railway, Fly.io) works too: run migrations in the release
 command, serve the built frontend from the same platform or a static host, and
@@ -372,7 +420,12 @@ backend_venv\Scripts\python.exe manage.py backup_shop --destination D:\ShopBacku
    `backup_shop` writes a consistent copy through SQLite's own backup API (a plain
    file copy can catch a page half-written or leave its WAL behind), copies the
    product photos, opens the copy again to prove it reads, and keeps the newest 30
-   copies. Put the destination on a second disk and carry a copy off the machine
+   copies. Each copy is written beside a `shop-<stamp>.manifest.txt` that says the
+   engine, the source, the bytes, the receipt and payment counts, and the restore
+   command - so a folder of thirty undated files is not a mystery at 3am. No secret
+   is written there: a PostgreSQL source is named by host and database only.
+   Pruning removes a copy together with its manifest, never one without the other.
+   Put the destination on a second disk and carry a copy off the machine
    weekly; `--dry-run` and `--keep` are there for when you want to look first.
 3. **Test a restore twice a year**: stop the server, set `DATABASE_PATH` to one of
    the copies, start, and check the receipts and the ledger are there. Then put
@@ -390,8 +443,13 @@ and must never be deleted on its own.
   retry after a timeout cannot create a second receipt or sell the last unit twice.
 - Indexes cover receipts by date/branch, sales by product/date, payments by
   status/date and expenses by branch/category/date. Lists are paginated.
-- A hosted PostgreSQL install (see the VPS section) is backed up with `pg_dump`
-  instead of `backup_shop`, and the same 30-copy rule applies.
+- The same `backup_shop` command works on either engine: it asks the database
+  which one it is, then uses SQLite's backup API or `pg_dump --format=custom`,
+  verifies the result (`PRAGMA integrity_check`, or `pg_restore --list` - which reads
+  the file instead of piping a whole database through memory) and names the file
+  `.sqlite3` or `.dump` accordingly. The 30-copy rule and the manifest are the
+  same either way, so the schedule in the next section does not change with the
+  database.
 
 ### Growing to several branches
 
@@ -433,11 +491,14 @@ Use the folder you actually copied the project to. On a Linux host the same thre
 lines go in cron:
 
 ```bash
-*/5  * * * * cd /srv/duka-pos/backend && .venv/bin/python manage.py reconcile_mpesa --older-than 5
-*/15 * * * * cd /srv/duka-pos/backend && .venv/bin/python manage.py deliver_alerts
-30 21 * * *  cd /srv/duka-pos/backend && .venv/bin/python manage.py backup_shop --destination /srv/backups
+*/5  * * * * cd /srv/duka-pos/backend && backend_venv/bin/python manage.py reconcile_mpesa --older-than 5 >> /srv/duka-pos/backend/logs/reconcile.log 2>&1
+*/15 * * * * cd /srv/duka-pos/backend && backend_venv/bin/python manage.py deliver_alerts >> /srv/duka-pos/backend/logs/alerts.log 2>&1
+30 21 * * *  cd /srv/duka-pos/backend && backend_venv/bin/python manage.py backup_shop --destination /srv/backups >> /srv/duka-pos/backend/logs/backup.log 2>&1
 ```
 
+Use the server's own virtualenv path (`backend_venv`, the same name the shop
+machine uses) and write to a log file: cron runs without a terminal, so output
+that is not redirected is thrown away along with any clue about a failed run.
 All three accept `--dry-run` to print what they would change without touching
 anything. A sale recorded while M-Pesa or Twilio is unreachable is never lost:
 the receipt and the alert row are already committed, and the next run picks
@@ -446,14 +507,46 @@ them up.
 ## Tests and checks
 
 ```bash
-cd backend && .venv/bin/python manage.py test     # or .venv\Scripts\python.exe
+cd backend && python manage.py test                  # the virtualenv's python
+cd backend && python manage.py check --deploy        # only what a public server must fix
+cd backend && python manage.py check_mpesa           # before a real customer pays
 cd frontend && npm test && npm run lint && npm run build
 ```
 
 Backend coverage includes money paths, wholesale cost-floor enforcement,
 branch isolation, cashier cost masking, CSV import, super-admin permissions,
-expenses and M-Pesa callbacks. Run all three after any change and before
-deploying.
+expenses, returns and refunds, M-Pesa callbacks (late, duplicated and wrong
+amount), the `check_mpesa` pre-flight and the startup checks. Run all of it
+after any change and before deploying.
+
+**`manage.py check_mpesa`** is the pre-flight for Daraja. It reads `.env` and
+reports each setting by name with a character count only - never a value, so its
+output is safe to paste into a support chat - then checks the callback URL is
+HTTPS, publicly addressable and on the path this app actually serves, and asks
+Daraja for a token for real (`--skip-live` to stay offline). Add
+`--test-stk 07XXXXXXXX` to send yourself a KES 1 prompt that is **not** saved as a
+payment, so the ledger never has to explain a test row. It exits non-zero when
+anything fails.
+
+**`manage.py check`** runs on every start and splits by audience, because a
+half-configured M-Pesa setup loses payments without saying so:
+
+| Id | Meaning |
+| --- | --- |
+| `config.W001` | The database file sits in a synced folder (OneDrive/Dropbox). |
+| `config.E010` / `E011` | `MEDIA_ROOT` cannot be created / is not writable - product photos and receipts fail silently. |
+| `config.W016` | Some M-Pesa keys are filled and some are empty. |
+| `config.E015` | `MPESA_ENVIRONMENT` is neither `sandbox` nor `production`. |
+| `config.W017`-`W019` | The same callback problems as below, downgraded to warnings while `DEBUG=True` so a laptop using a tunnel address still starts. |
+| `config.E012`-`E014` | On a trading server: empty callback URL, a callback that is not public HTTPS, or a placeholder `MPESA_CALLBACK_TOKEN`. |
+
+The last two groups are why `--deploy` exists: `config.W010`-`W015` (DEBUG on,
+short `SECRET_KEY`, `ALLOWED_HOSTS` with no public name, CORS still pointing at
+the dev machine, empty `CSRF_TRUSTED_ORIGINS`, sandbox M-Pesa on a shop that
+looks live) are the hosting choices only a public server has to get right, so
+they appear with `--deploy` and never interrupt a local `runserver`.
+`deploy/duka-pos.service` gates the boot on `check --deploy --fail-level ERROR`:
+a server that cannot receive its own callbacks refuses to start.
 
 ## Environment variables
 
@@ -477,9 +570,11 @@ Never commit `.env` files or real M-Pesa/Twilio secrets.
 | --- | --- |
 | `Invalid Access Token` / 401 from Daraja | Wrong consumer key/secret or sandbox vs production mismatch. |
 | `Bad Request - Invalid Shortcode` | `MPESA_SHORTCODE` is not the production Paybill or the app is still sandbox. |
-| Prompt arrives but receipt never updates | Callback URL unreachable, wrong `MPESA_CALLBACK_TOKEN`, or `ALLOWED_HOSTS` rejects the host. Run the reconciler and check server logs. |
+| Prompt arrives but receipt never updates | Callback URL unreachable, wrong `MPESA_CALLBACK_TOKEN`, or `ALLOWED_HOSTS` rejects the host. Run `manage.py check_mpesa`, then the reconciler, and check server logs. |
 | `The security credential is invalid` | Wrong passkey for this shortcode/environment. |
-| "An M-Pesa payment prompt is already pending" | Wait for the 5-minute timeout or let the reconciler expire the old prompt. |
+| "An M-Pesa payment prompt is already pending" | Deliberate: Daraja is still holding an accepted prompt on that bill, so a second one is refused rather than asking the customer to pay twice. Press **Check status** to ask for the answer, or let `reconcile_mpesa` do it. Only a prompt Safaricom never accepted expires on the timeout. |
+| A bill that should be paid shows **overpaid** | The callback landed after the bill was already settled - by cash or by an earlier prompt. The money is real and is shown so it can be handed back; check the payment history for two M-Pesa receipt codes and reconcile them against the Paybill statement. |
+| Returns are refused on a bill | An M-Pesa prompt on it is still waiting. Settle or fail that prompt first, or the refund goes out twice. |
 | Customer paid but amount mismatch | The callback amount is compared with the requested amount; mismatches are failed and shown with Safaricom's description. |
 
 ## License

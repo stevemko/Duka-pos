@@ -3,6 +3,8 @@ import sqlite3
 import tempfile
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -266,3 +268,72 @@ class BackupShopCommandTests(TransactionTestCase):
 
         self.assertTrue((self.destination / "media" / "products" / "bulb.jpg").exists())
         self.assertIn("2 photo file(s) copied", self.output.getvalue())
+
+    def test_a_note_is_left_beside_the_copy_saying_what_it_holds(self):
+        copies = self.back_up()
+
+        manifest = next(self.destination.glob("shop-*.manifest.txt"))
+        text = manifest.read_text(encoding="utf-8")
+
+        self.assertIn("engine: sqlite", text)
+        self.assertIn(copies[0], text)
+        self.assertIn("restore:", text)
+
+    def test_pruning_takes_a_copy_and_its_note_together(self):
+        for name in ("shop-2026-01-01-000000", "shop-2026-01-02-000000"):
+            (self.destination / f"{name}.sqlite3").write_bytes(b"old")
+            (self.destination / f"{name}.manifest.txt").write_text("old", encoding="utf-8")
+
+        self.back_up("--keep", "2")
+
+        self.assertFalse((self.destination / "shop-2026-01-01-000000.sqlite3").exists())
+        self.assertFalse((self.destination / "shop-2026-01-01-000000.manifest.txt").exists())
+        self.assertTrue((self.destination / "shop-2026-01-02-000000.manifest.txt").exists())
+
+    def test_a_postgres_database_is_copied_with_pg_dump(self):
+        """The branch written before the shop ever moves engines.
+
+        A backup job that dies with an error on the night of a migration is how a
+        shop loses a month of books, so the Postgres path has to work the first
+        time it is needed.
+        """
+        database = SimpleNamespace(
+            vendor="postgresql",
+            settings_dict={
+                "NAME": "greenlight", "USER": "duka", "PASSWORD": "db-secret",
+                "HOST": "10.0.0.5", "PORT": "5432",
+            },
+        )
+        calls = []
+
+        def run(argv, *args, **kwargs):
+            calls.append((argv, kwargs.get("env")))
+            for argument in argv:
+                if argument.startswith("--file="):
+                    Path(argument.split("=", 1)[1]).write_bytes(b"dump")
+                elif argument.startswith("--list="):
+                    Path(argument.split("=", 1)[1]).write_text(
+                        "TABLE sales_salereceipt", encoding="utf-8"
+                    )
+            return SimpleNamespace(stdout="", stderr="")
+
+        with \
+            patch("accounts.management.commands.backup_shop.connections", {"default": database}), \
+            patch("accounts.management.commands.backup_shop.subprocess.run", side_effect=run):
+            call_command(
+                "backup_shop", "--destination", str(self.destination),
+                "--without-media", stdout=self.output,
+            )
+
+        argv, env = calls[0]
+        self.assertEqual(argv[0], "pg_dump")
+        self.assertIn("--format=custom", argv)
+        # A password typed on a command line is readable by every other process on
+        # the machine, so it travels in the environment instead.
+        self.assertNotIn("db-secret", " ".join(argv))
+        self.assertEqual(env["PGPASSWORD"], "db-secret")
+        self.assertTrue(list(self.destination.glob("shop-*.dump")))
+        self.assertIn("opens cleanly", self.output.getvalue())
+        manifest = next(self.destination.glob("shop-*.manifest.txt"))
+        self.assertIn("engine: postgresql", manifest.read_text(encoding="utf-8"))
+        self.assertNotIn("db-secret", manifest.read_text(encoding="utf-8"))
