@@ -299,3 +299,9 @@ LOGGING = {
         'level': config('LOG_LEVEL', default='INFO'),
     },
 }
+
+
+# The opening checks are registered here, the same way the SQLite tuning is:
+# importing the module is what puts them in front of `manage.py check`, and every
+# start of the server runs that command.
+from config import checks as opening_checks  # noqa: E402, F401
