@@ -127,19 +127,20 @@
 		margin: 3mm;
 	}
 
-	body * {
-		visibility: hidden !important;
+	/* The print copy is portalled onto document.body, so the screen can be taken
+	   out of the layout instead of merely made invisible. visibility:hidden kept
+	   the whole till's height on the paper, and the fixed receipt that answered it
+	   was repainted on every page - two receipts on the roll for one sale. */
+	body > *:not(.print-receipt) {
+		display: none !important;
 	}
 
-	.print-receipt,
-	.print-receipt * {
-		visibility: visible !important;
+	body {
+		background: #fff;
 	}
 
 	.print-receipt {
 		display: block !important;
-		position: fixed;
-		inset: 0 auto auto 0;
 		width: 72mm;
 		padding: 0;
 		margin: 0;

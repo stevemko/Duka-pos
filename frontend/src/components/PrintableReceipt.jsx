@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { useAuth } from "../auth/AuthContext";
 
 const SHOP_NAME = import.meta.env.VITE_SHOP_NAME || "Greenlight LED Accessories";
@@ -15,7 +16,9 @@ export default function PrintableReceipt({ receipt, title = "SALES RECEIPT" }) {
   const returnedValue = Number(receipt.returned_total || 0);
   const refundedValue = Number(receipt.refunded_total || 0);
 
-  return (
+  // Portalled onto the document body so printing can switch the till itself off.
+  // Nested inside the app, the paper would carry the screen's height with it.
+  return createPortal(
     <article className="print-receipt" aria-label="Receipt for printing">
       <header className="receipt-center">
         <h1>{name}</h1>
@@ -134,6 +137,7 @@ export default function PrintableReceipt({ receipt, title = "SALES RECEIPT" }) {
       )}
       <div className="receipt-rule" />
       <p className="receipt-center">Thank you for shopping with us.</p>
-    </article>
+    </article>,
+    document.body,
   );
 }
