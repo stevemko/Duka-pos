@@ -108,6 +108,10 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
     refunded_total = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     amount_paid = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     balance = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
+    # What the till holds beyond this bill: a cash payment that an M-Pesa prompt
+    # later doubled. A balance floors at zero, so this is the only place the shop
+    # is told it is carrying someone's change.
+    overpaid_amount = serializers.DecimalField(max_digits=10, decimal_places=2, read_only=True)
     payment_status = serializers.CharField(read_only=True)
     branch_name = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
@@ -117,7 +121,7 @@ class SaleReceiptSerializer(serializers.ModelSerializer):
         fields = [
             "id", "branch", "branch_name", "created_by_name", "customer", "customer_name",
             "customer_phone", "items", "payments", "returns", "total", "returned_total",
-            "net_total", "refunded_total", "amount_paid", "balance",
+            "net_total", "refunded_total", "amount_paid", "balance", "overpaid_amount",
             "payment_status", "created_at", "closed_at",
         ]
 

@@ -27,6 +27,27 @@ def stk_pending_cutoff():
     return timezone.now() - timedelta(minutes=settings.MPESA_STK_PENDING_TIMEOUT_MINUTES)
 
 
+def unresolved_stk_prompts():
+    """M-Pesa prompts Safaricom could still answer, as a reusable filter.
+
+    A prompt that came back with a checkout request id is a live question at
+    Daraja, however long the counter has waited, so only their own answer may close
+    it. A prompt that never got an id asked nothing and stops counting once the
+    pending window passes - the till may send another.
+
+    Every surface that talks about an open prompt reads this: the waiting badge,
+    the rule against a second prompt, and the rule against a return. Letting an
+    answered-by-Daraja-only prompt fall out of that set is how a customer's money
+    arrives against a bill the books have already given up on.
+    """
+    from sales.models import Payment
+
+    has_request_id = Q(checkout_request_id__isnull=False) & ~Q(checkout_request_id="")
+    return Q(method=Payment.Method.MPESA_STK, status=Payment.Status.PENDING) & (
+        has_request_id | Q(created_at__gte=stk_pending_cutoff())
+    )
+
+
 def normalize_customer_phone(phone):
     """Put a shop-floor phone number in one shape, or return "" if it is not one.
 
@@ -206,11 +227,7 @@ class SaleReceiptQuerySet(models.QuerySet):
             .values("total")
         )
         active_pending = (
-            Payment.objects.filter(
-                receipt=OuterRef("pk"),
-                status=Payment.Status.PENDING,
-                created_at__gte=stk_pending_cutoff(),
-            )
+            Payment.objects.filter(unresolved_stk_prompts(), receipt=OuterRef("pk"))
             .values("receipt")
             .annotate(total=Count("id"))
             .values("total")
@@ -344,6 +361,19 @@ class SaleReceipt(models.Model):
         return owed if owed > 0 else Decimal("0.00")
 
     @property
+    def overpaid_amount(self):
+        """What the till holds for this bill beyond what the bill asks for.
+
+        The balance above floors at zero, so money that arrived twice - a prompt
+        confirmed after the cashier already took cash - would otherwise disappear
+        from every figure the shop reads. This keeps it in the open, where it can
+        be handed back. Money already handed back with a return is subtracted, or
+        a settled refund would read as a second debt to the same customer.
+        """
+        surplus = self.amount_paid - self.net_total - self.refunded_total
+        return surplus if surplus > 0 else Decimal("0.00")
+
+    @property
     def payment_status(self):
         # Money that already covers the bill wins over an open prompt: a customer
         # who pays cash while their M-Pesa request still sits on the phone has
@@ -353,10 +383,7 @@ class SaleReceipt(models.Model):
         if hasattr(self, "annotated_pending_count"):
             has_active_pending = self.annotated_pending_count > 0
         else:
-            has_active_pending = self.payments.filter(
-                status=Payment.Status.PENDING,
-                created_at__gte=stk_pending_cutoff(),
-            ).exists()
+            has_active_pending = self.payments.filter(unresolved_stk_prompts()).exists()
         if has_active_pending:
             return "payment_pending"
         if self.amount_paid > 0:
@@ -364,13 +391,24 @@ class SaleReceipt(models.Model):
         return "on_credit"
 
     def expire_stale_stk_payments(self):
+        """Give up only on prompts that never reached Safaricom.
+
+        A prompt holding a checkout request id is Daraja's question to answer, and
+        a PIN typed at minute nine is real money. Failing it on a clock here is how
+        a paid-for bill ends up marked unpaid, so it waits for `check-payment` or
+        `reconcile_mpesa` to ask. A prompt with no id was never accepted at all:
+        nothing is coming, and the cashier must be able to send another.
+        """
+        unaccepted = Q(checkout_request_id__isnull=True) | Q(checkout_request_id="")
         return self.payments.filter(
             method=Payment.Method.MPESA_STK,
             status=Payment.Status.PENDING,
             created_at__lt=stk_pending_cutoff(),
-        ).update(
+        ).filter(unaccepted).update(
             status=Payment.Status.FAILED,
-            result_description="M-Pesa confirmation timed out. Prompt the customer again if needed.",
+            result_description=(
+                "M-Pesa prompt was never accepted by Safaricom. Send it again if needed."
+            ),
         )
 
     def __str__(self):

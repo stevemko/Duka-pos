@@ -48,7 +48,7 @@ from .models import (
     SaleReceipt,
     SaleReturn,
     SaleReturnItem,
-    stk_pending_cutoff,
+    unresolved_stk_prompts,
 )
 from .mpesa import (
     MpesaError,
@@ -948,11 +948,14 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
             receipt = SaleReceipt.objects.select_for_update().get(pk=pk)
             _assert_receipt_access(request.user, receipt)
             receipt.expire_stale_stk_payments()
-            if receipt.payments.filter(
-                status=Payment.Status.PENDING,
-                created_at__gte=stk_pending_cutoff(),
-            ).exists():
-                raise ValidationError({"payment": "An M-Pesa payment prompt is already pending for this receipt."})
+            if receipt.payments.filter(unresolved_stk_prompts()).exists():
+                raise ValidationError({
+                    "payment": (
+                        "An earlier M-Pesa prompt on this bill has not been answered yet. "
+                        "Use Check status first: only Safaricom can say whether that prompt "
+                        "went through, and a second one would ask the customer to pay twice."
+                    )
+                })
             amount = data.get("amount", receipt.balance)
             if amount <= 0:
                 raise ValidationError({"amount": "This receipt has no outstanding balance."})
@@ -1168,10 +1171,7 @@ class SaleReceiptViewSet(viewsets.ReadOnlyModelViewSet):
                         "receipt": "This bill is in a closed period. Reopen the period "
                                    "before taking goods back against it."
                     })
-                if receipt.payments.filter(
-                    status=Payment.Status.PENDING,
-                    created_at__gte=stk_pending_cutoff(),
-                ).exists():
+                if receipt.payments.filter(unresolved_stk_prompts()).exists():
                     # The customer may still be about to pay the whole old total. A
                     # return taken underneath that prompt would let money arrive for
                     # goods that already came back, with nothing to hand it over for.
@@ -1289,7 +1289,10 @@ def mpesa_callback(request):
             checkout_request_id=checkout_request_id,
             method=Payment.Method.MPESA_STK,
         ).first()
-        if not payment or payment.status != Payment.Status.PENDING:
+        if not payment or payment.status == Payment.Status.SUCCEEDED:
+            # Already settled one way or the other: a replay changes nothing. A
+            # prompt this server had given up on is still open to proof, because
+            # only Daraja can say whether the customer typed the PIN.
             return Response({"ResultCode": 0, "ResultDesc": "Accepted"}, status=status.HTTP_200_OK)
 
         result_code = callback.get("ResultCode")
@@ -1307,6 +1310,16 @@ def mpesa_callback(request):
             except (InvalidOperation, TypeError, ValueError):
                 callback_amount = None
             if callback_amount is not None and callback_amount == payment.amount:
+                # A prompt this server had already given up on can still be proved
+                # paid - the customer typed the PIN after the till stopped waiting.
+                # The money is real, so the books take it whatever the earlier guess
+                # said, and the bill now shows what it over-collected.
+                if payment.status == Payment.Status.FAILED:
+                    logger.warning(
+                        "M-Pesa callback settled prompt %s that had been marked failed; "
+                        "the till must check whether the customer already paid in cash.",
+                        payment.checkout_request_id,
+                    )
                 payment.status = Payment.Status.SUCCEEDED
                 payment.reference = str(metadata.get("MpesaReceiptNumber", ""))[:100]
             else:

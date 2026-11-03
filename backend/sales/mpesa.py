@@ -123,6 +123,17 @@ def _access_token(settings_values):
     if cached:
         return cached
 
+    token = fetch_access_token(settings_values)
+    cache.set(cache_key, token, _TOKEN_TTL_SECONDS)
+    return token
+
+
+def fetch_access_token(settings_values):
+    """Ask Daraja for a token now, ignoring any cached one.
+
+    Split out so `check_mpesa` can prove the live keys work; a pre-flight that
+    reads a token from cache proves nothing about the credentials on disk.
+    """
     credentials = base64.b64encode(
         f"{settings_values['consumer_key']}:{settings_values['consumer_secret']}".encode("utf-8")
     ).decode("ascii")
@@ -132,13 +143,19 @@ def _access_token(settings_values):
     )
     try:
         with urlopen(token_request, timeout=_timeout()) as response:
-            token = json.loads(response.read().decode("utf-8"))["access_token"]
-    except (HTTPError, URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
+            return json.loads(response.read().decode("utf-8"))["access_token"]
+    except HTTPError as error:
+        logger.warning("Daraja authentication failed with HTTP %s", error.code)
+        if error.code in (400, 401):
+            raise MpesaError(
+                "Daraja refused these keys (HTTP %s). The usual reason is a key from "
+                "the other environment: sandbox keys only work on sandbox.safaricom.co.ke "
+                "and production keys only on api.safaricom.co.ke." % error.code
+            ) from error
+        raise MpesaError(f"Could not authenticate with Safaricom Daraja (HTTP {error.code}).") from error
+    except (URLError, TimeoutError, KeyError, json.JSONDecodeError) as error:
         logger.warning("Daraja authentication failed: %s", error)
         raise MpesaError("Could not authenticate with Safaricom Daraja.") from error
-
-    cache.set(cache_key, token, _TOKEN_TTL_SECONDS)
-    return token
 
 
 def _api_host(settings_values):

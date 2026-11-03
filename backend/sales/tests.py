@@ -22,7 +22,7 @@ from .models import (
     SaleReturnItem,
     normalize_customer_phone,
 )
-from .mpesa import MpesaError, MpesaUnconfirmed, initiate_stk_push
+from .mpesa import MpesaError, MpesaUnconfirmed, fetch_access_token, initiate_stk_push
 
 
 class SaleStockTests(TestCase):
@@ -1032,6 +1032,122 @@ class MpesaCallbackEdgeTests(TestCase):
 		self.assertEqual(self.receipt.amount_paid, Decimal("125.00"))
 
 	@patch("sales.views.config", return_value="test-callback-token")
+	@patch("sales.views.initiate_stk_push")
+	def test_second_prompt_waits_while_daraja_still_holds_the_first(self, initiate, _config):
+		initiate.return_value = {"ResponseCode": "0", "CheckoutRequestID": "checkout-first"}
+		self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": self.receipt.id}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+		# Long enough that the till has stopped waiting, but the prompt is still a
+		# live question at Daraja and could yet be paid.
+		Payment.objects.filter(checkout_request_id="checkout-first").update(
+			created_at=timezone.now() - timedelta(hours=1)
+		)
+
+		second = self.client.post(
+			reverse("receipt-stk-push", kwargs={"pk": self.receipt.id}),
+			{"phone": "0794671494"},
+			format="json",
+		)
+
+		self.assertEqual(second.status_code, 400)
+		self.assertIn("Check status", str(second.data["payment"]))
+		self.assertEqual(self.receipt.payments.count(), 1)
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	def test_callback_is_ignored_when_the_payment_is_already_recorded(self, _config):
+		Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.SUCCEEDED,
+			checkout_request_id="checkout-settled",
+			reference="SETTLED1",
+		)
+
+		response = self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{"Body": {"stkCallback": {
+				"CheckoutRequestID": "checkout-settled",
+				"ResultCode": 0,
+				"CallbackMetadata": {"Item": [
+					{"Name": "Amount", "Value": 125},
+					{"Name": "MpesaReceiptNumber", "Value": "SETTLED2"},
+				]},
+			}}},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		payment = Payment.objects.get(checkout_request_id="checkout-settled")
+		self.assertEqual(payment.reference, "SETTLED1")
+		self.assertEqual(self.receipt.amount_paid, Decimal("125.00"))
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	def test_late_callback_pays_a_prompt_the_till_had_given_up_on(self, _config):
+		"""An older build marked this prompt failed on a timer; the money still came.
+
+		Taking the payment settles the bill instead of losing it, and the till is
+		told what it is holding, rather than leaving the surplus invisible.
+		"""
+		Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.FAILED,
+			checkout_request_id="checkout-came-back",
+			result_description="M-Pesa confirmation timed out. Prompt the customer again if needed.",
+		)
+
+		response = self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{"Body": {"stkCallback": {
+				"CheckoutRequestID": "checkout-came-back",
+				"ResultCode": 0,
+				"ResultDesc": "Success",
+				"CallbackMetadata": {"Item": [
+					{"Name": "Amount", "Value": 125},
+					{"Name": "MpesaReceiptNumber", "Value": "LATE9C1P2"},
+				]},
+			}}},
+			format="json",
+		)
+
+		self.assertEqual(response.status_code, 200)
+		payment = Payment.objects.get(checkout_request_id="checkout-came-back")
+		self.assertEqual(payment.status, Payment.Status.SUCCEEDED)
+		self.assertEqual(payment.reference, "LATE9C1P2")
+		self.receipt.refresh_from_db()
+		self.assertEqual(self.receipt.balance, Decimal("0.00"))
+
+	@patch("sales.views.config", return_value="test-callback-token")
+	def test_late_callback_with_the_wrong_amount_does_not_pay_the_bill(self, _config):
+		Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.MPESA_STK,
+			status=Payment.Status.FAILED,
+			checkout_request_id="checkout-short",
+		)
+
+		self.client.post(
+			reverse("mpesa-callback") + "?token=test-callback-token",
+			{"Body": {"stkCallback": {
+				"CheckoutRequestID": "checkout-short",
+				"ResultCode": 0,
+				"CallbackMetadata": {"Item": [{"Name": "Amount", "Value": 25}]}
+			}}},
+			format="json",
+		)
+
+		payment = Payment.objects.get(checkout_request_id="checkout-short")
+		self.assertEqual(payment.status, Payment.Status.FAILED)
+		self.receipt.refresh_from_db()
+		self.assertEqual(self.receipt.balance, Decimal("125.00"))
+
+	@patch("sales.views.config", return_value="test-callback-token")
 	def test_callback_rejects_malformed_payload(self, _config):
 		response = self.client.post(
 			reverse("mpesa-callback") + "?token=test-callback-token",
@@ -1084,6 +1200,38 @@ class StaleStkPaymentTests(TestCase):
 		self.assertEqual(self.receipt.expire_stale_stk_payments(), 0)
 		self.payment.refresh_from_db()
 		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+
+	def test_prompt_held_by_daraja_is_never_expired_by_the_clock(self):
+		"""An old prompt that Safaricom accepted stays open until they answer.
+
+		A PIN typed at minute six is real money, and a bill whose cash was taken in
+		the meantime is settled over the counter, not quietly written off here.
+		"""
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=40),
+			checkout_request_id="checkout-held-by-daraja",
+		)
+
+		self.assertEqual(self.receipt.expire_stale_stk_payments(), 0)
+
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.PENDING)
+		self.receipt.refresh_from_db()
+		self.assertEqual(self.receipt.payment_status, "payment_pending")
+
+	def test_overpaid_bill_reports_what_the_till_is_holding(self):
+		Payment.objects.filter(pk=self.payment.pk).update(status=Payment.Status.SUCCEEDED)
+		Payment.objects.create(
+			receipt=self.receipt,
+			amount=Decimal("125.00"),
+			method=Payment.Method.CASH,
+			status=Payment.Status.SUCCEEDED,
+		)
+
+		self.receipt.refresh_from_db()
+
+		self.assertEqual(self.receipt.balance, Decimal("0.00"))
+		self.assertEqual(self.receipt.overpaid_amount, Decimal("125.00"))
 
 
 class ReconcileMpesaCommandTests(TestCase):
@@ -1229,9 +1377,35 @@ class CheckPaymentStatusTests(TestCase):
 		self.assertEqual(self.payment.status, Payment.Status.PENDING)
 
 	@patch("sales.views.query_stk_push")
-	def test_expired_prompt_is_reported_without_calling_daraja(self, query):
+	def test_old_prompt_is_still_asked_of_daraja(self, query):
+		query.return_value = {
+			"ResultCode": "0",
+			"ResultDesc": "The service request is processed successfully.",
+			"CallbackMetadata": {
+				"Item": [
+					{"Name": "Amount", "Value": 125},
+					{"Name": "MpesaReceiptNumber", "Value": "SLK9C1P2QY"},
+				]
+			},
+		}
 		Payment.objects.filter(pk=self.payment.pk).update(
 			created_at=timezone.now() - timedelta(minutes=10)
+		)
+
+		response = self.check()
+
+		# The clock is not evidence. A prompt holding a checkout request id can be
+		# answered long after the till stopped waiting, and a PIN typed then is
+		# money the shop has actually received.
+		self.assertEqual(response.data["state"], "paid")
+		query.assert_called_once()
+		self.payment.refresh_from_db()
+		self.assertEqual(self.payment.status, Payment.Status.SUCCEEDED)
+
+	@patch("sales.views.query_stk_push")
+	def test_prompt_that_never_reached_safaricom_is_closed_without_asking(self, query):
+		Payment.objects.filter(pk=self.payment.pk).update(
+			created_at=timezone.now() - timedelta(minutes=10), checkout_request_id=None
 		)
 
 		response = self.check()
@@ -2085,7 +2259,170 @@ class ReturnTests(TestCase):
 		self.assertEqual(taken.data["balance"], "0.00")
 		self.assertEqual(taken.data["payment_status"], "paid")
 		self.assertEqual(taken.data["refunded_total"], "375.00")
+		# The cash went back over the counter with this return. Reading the settled
+		# bill as KES 375 overpaid would send the cashier looking for money already
+		# handed over.
+		self.assertEqual(taken.data["overpaid_amount"], "0.00")
 
 		listed = self.client.get(reverse("receipt-list"), {"status": "paid"})
 		self.assertEqual(listed.data["count"], 1)
 		self.assertEqual(self.client.get(reverse("receipt-credits")).data["receipt_count"], 0)
+
+
+class _CallbackReply:
+	"""A stand-in for urlopen's answer, usable as a context manager."""
+
+	def __init__(self, status):
+		self.status = status
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc):
+		return False
+
+
+class CheckMpesaCommandTests(TestCase):
+	"""The pre-flight has to catch the mistakes that silently lose payments."""
+
+	GOOD = {
+		"MPESA_ENVIRONMENT": "production",
+		"MPESA_CONSUMER_KEY": "consumer-key-value",
+		"MPESA_CONSUMER_SECRET": "consumer-secret-value",
+		"MPESA_SHORTCODE": "174344",
+		"MPESA_PASSKEY": "passkey-value",
+		"MPESA_CALLBACK_URL": "https://pos.greenlight.co.ke/api/mpesa/callback/",
+		"MPESA_CALLBACK_TOKEN": "callback-token-value",
+	}
+
+	def _run(self, overrides=None, open_error=None, fetch_error=None, **options):
+		values = {**self.GOOD, **(overrides or {})}
+		stdout = StringIO()
+		kwargs = {"skip_live": True, **options}
+		target = "sales.management.commands.check_mpesa"
+		if open_error:
+			open_patch = patch(f"{target}.urlopen", side_effect=open_error)
+		else:
+			open_patch = patch(f"{target}.urlopen", return_value=_CallbackReply(405))
+		if fetch_error:
+			fetch_patch = patch(f"{target}.fetch_access_token", side_effect=fetch_error)
+		else:
+			fetch_patch = patch(f"{target}.fetch_access_token", return_value="token")
+		with \
+			patch(
+				f"{target}.config",
+				side_effect=lambda name, default="", cast=None: values.get(name, default),
+			), \
+			patch(f"{target}._load_config", return_value=values), \
+			fetch_patch, open_patch, \
+			patch(
+				f"{target}.initiate_stk_push",
+				return_value={"ResponseCode": "0", "CheckoutRequestID": "test-prompt-1"},
+			):
+			try:
+				call_command("check_mpesa", stdout=stdout, **kwargs)
+			except SystemExit as stop:
+				return stdout.getvalue(), stop.code
+			return stdout.getvalue(), None
+
+	def test_complete_public_configuration_passes(self):
+		text, code = self._run()
+
+		self.assertIsNone(code, text)
+		self.assertIn("Configuration looks ready", text)
+
+	def test_live_check_asks_daraja_and_the_public_callback_url(self):
+		text, code = self._run(skip_live=False)
+
+		self.assertIsNone(code, text)
+		self.assertIn("issued an access token", text)
+		self.assertIn("answers HTTP 405", text)
+
+	def test_sandbox_keys_warn_because_no_real_money_moves(self):
+		text, code = self._run({"MPESA_ENVIRONMENT": "sandbox"})
+
+		self.assertIsNone(code, text)
+		self.assertIn("never settle real money", text)
+
+	def test_a_local_callback_url_stops_the_check(self):
+		text, code = self._run({"MPESA_CALLBACK_URL": "http://localhost:8000/api/mpesa/callback/"})
+
+		self.assertEqual(code, 1)
+		self.assertIn("https://", text)
+
+	def test_a_callback_url_on_the_shop_network_stops_the_check(self):
+		text, code = self._run({"MPESA_CALLBACK_URL": "https://192.168.1.20/api/mpesa/callback/"})
+
+		self.assertEqual(code, 1)
+		self.assertIn("Safaricom cannot reach it", text)
+
+	def test_a_callback_url_pointing_at_the_wrong_route_stops_the_check(self):
+		text, code = self._run({"MPESA_CALLBACK_URL": "https://pos.example.co.ke/api/mpesa-callback/"})
+
+		self.assertEqual(code, 1)
+		self.assertIn("/api/mpesa/callback/", text)
+
+	def test_a_setting_left_as_the_example_is_rejected(self):
+		text, code = self._run({"MPESA_CALLBACK_TOKEN": "generate-a-long-random-value"})
+
+		self.assertEqual(code, 1)
+		self.assertIn("placeholder", text)
+
+	def test_a_missing_setting_is_named(self):
+		text, code = self._run({"MPESA_SHORTCODE": ""})
+
+		self.assertEqual(code, 1)
+		self.assertIn("MPESA_SHORTCODE is not set", text)
+
+	def test_unreachable_callback_url_is_reported_as_a_problem(self):
+		text, code = self._run(
+			skip_live=False, open_error=URLError("no route to host")
+		)
+
+		self.assertEqual(code, 1)
+		self.assertIn("Could not reach", text)
+
+	def test_keys_from_the_other_environment_stop_the_check(self):
+		text, code = self._run(
+			skip_live=False,
+			fetch_error=MpesaError(
+				"Daraja refused these keys (HTTP 401). The usual reason is a key from "
+				"the other environment."
+			),
+		)
+
+		self.assertEqual(code, 1)
+		self.assertIn("other environment", text)
+
+	def test_no_secret_value_is_ever_written_out(self):
+		text, _ = self._run(skip_live=False, test_stk="0794671494")
+
+		for name, value in self.GOOD.items():
+			if name in {"MPESA_ENVIRONMENT", "MPESA_CALLBACK_URL"}:
+				continue
+			self.assertNotIn(value, text, f"{name} leaked into the report")
+
+	def test_a_test_prompt_leaves_nothing_in_the_ledger(self):
+		text, code = self._run(test_stk="0794671494")
+
+		self.assertIsNone(code, text)
+		self.assertIn("test-prompt-1", text)
+		self.assertEqual(Payment.objects.count(), 0)
+
+
+class DarajaWrongEnvironmentTests(TestCase):
+	def test_refused_keys_are_explained_as_an_environment_mixup(self):
+		def refuse(request, *args, **kwargs):
+			raise HTTPError(
+				request.full_url, 401, "Unauthorized", {}, BytesIO(b"{}")
+			)
+
+		with patch("sales.mpesa.urlopen", side_effect=refuse):
+			with self.assertRaises(MpesaError) as caught:
+				fetch_access_token({
+					"consumer_key": "sandbox-key",
+					"consumer_secret": "sandbox-secret",
+					"environment": "production",
+				})
+
+		self.assertIn("other environment", str(caught.exception))

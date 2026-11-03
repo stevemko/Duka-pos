@@ -16,6 +16,12 @@ export default function ReceiptSuccessCard({
 }) {
   if (!receipt) return null;
   const balance = Number(receipt.balance);
+  const overpaid = Number(receipt.overpaid_amount || 0);
+  // A prompt Safaricom has not answered is still a question about real money, even
+  // once the bill itself is settled by cash - so the till keeps the right to ask.
+  const openPrompt = (receipt.payments || []).some(
+    (entry) => entry.method === "mpesa_stk" && entry.status === "pending"
+  );
   const account = receipt.id.slice(0, 8).toUpperCase();
   const statusLabels = {
     paid: "Paid",
@@ -54,6 +60,16 @@ export default function ReceiptSuccessCard({
         </div>
       </div>
 
+      {overpaid > 0 && (
+        <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <Icon name="alert" size={15} className="mt-0.5 shrink-0" />
+          <p>
+            This bill has been paid <strong>KES {money(overpaid)}</strong> more than it owed.
+            Hand the difference back to the customer before closing the day.
+          </p>
+        </div>
+      )}
+
       {balance > 0 && shop?.paybill && (
         <div className="mt-3 flex items-start gap-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
           <Icon name="bank" size={15} className="mt-0.5 shrink-0" />
@@ -90,7 +106,7 @@ export default function ReceiptSuccessCard({
         <PaymentStatusBanner
           status={payment}
           checking={checkingPayment}
-          onCheck={balance > 0 ? onCheckPayment : null}
+          onCheck={balance > 0 || openPrompt ? onCheckPayment : null}
           onSendAgain={
             payment?.state === "not_paid" || payment?.state === "unknown" || payment?.state === "not_sent"
               ? () => onStk(receipt)
