@@ -228,6 +228,7 @@ STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+CLOUDINARY_URL = config('CLOUDINARY_URL', default='')
 
 # The built React app. Whitenoise serves it from the site root so one process on
 # one port gives the shop the UI, the API and the product images; the service
@@ -239,7 +240,7 @@ WHITENOISE_ROOT = FRONTEND_DIST
 WHITENOISE_MIMETYPES = {'.webmanifest': 'application/manifest+json'}
 
 STORAGES = {
-    'default': {'BACKEND': 'django.core.files.storage.FileSystemStorage'},
+    'default': {'BACKEND': 'products.storage.ProductImageStorage'},
     'staticfiles': {
         'BACKEND': 'whitenoise.storage.CompressedManifestStaticFilesStorage',
     },
